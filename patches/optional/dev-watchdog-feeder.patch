@@ -1,0 +1,73 @@
+From 0dc00d5e27c2fe6f6559f1bd5829aebad24fe813 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 13:14:07 +0100
+Subject: [PATCH] mips: ali-c3503d: DEV watchdog feeder with a runtime timeout
+ (not for release)
+
+---
+ arch/mips/ali-c3503d/Makefile       |  1 +
+ arch/mips/ali-c3503d/dev-watchdog.c | 47 +++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+ create mode 100644 arch/mips/ali-c3503d/dev-watchdog.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 940bfebd..f3348a88 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -6,2 +6,3 @@ obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc
+ obj-$(CONFIG_DEBUG_FS) += debug.o
+ obj-$(CONFIG_ALI_BOARD_ARIVA54) += board-ariva54.o
++obj-y += dev-watchdog.o
+diff --git a/arch/mips/ali-c3503d/dev-watchdog.c b/arch/mips/ali-c3503d/dev-watchdog.c
+new file mode 100644
+index 00000000..100a400d
+--- /dev/null
++++ b/arch/mips/ali-c3503d/dev-watchdog.c
+@@ -0,0 +1,47 @@
++/*
++ * DEV ONLY (patches/optional/dev-watchdog-feeder.patch): chip watchdog fed from a kernel timer.
++ *
++ * Arms the watchdog (0xB8018500: 32-bit counter at +0 counting 27 MHz / 32 = 843750 Hz, control byte at +4:
++ * 0x64 = run + reset on overflow) and reloads it from a kernel timer, so a hung kernel stops feeding and the box
++ * resets and comes back through the loader.  The timeout is a module parameter, changeable while running:
++ *
++ *   echo 5 > /sys/module/dev_watchdog/parameters/timeout        (seconds, 1..30)
++ *   dev_watchdog.timeout=5                                       (kernel command line)
++ *
++ * The timer runs at a third of the timeout (at least once a second).  Armed after the ali-wdt driver has probed,
++ * which leaves the dog disabled.
++ */
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/moduleparam.h>
++#include <linux/timer.h>
++
++#define DOG_COUNT	((void __iomem *)0xB8018500UL)
++#define DOG_CTRL	((void __iomem *)0xB8018504UL)
++#define DOG_HZ		843750u
++
++static unsigned int timeout = 5;
++module_param(timeout, uint, 0644);
++MODULE_PARM_DESC(timeout, "watchdog timeout in seconds (1..30)");
++
++static struct timer_list dog_timer;
++
++static void dog_feed(unsigned long unused)
++{
++	unsigned int t = clamp(timeout, 1u, 30u);
++
++	writel(0xFFFFFFFFu - DOG_HZ * t, DOG_COUNT);
++	mod_timer(&dog_timer, jiffies + max(1u, t / 3) * HZ);
++}
++
++static int __init dev_watchdog_init(void)
++{
++	writeb(0, DOG_CTRL);
++	setup_timer(&dog_timer, dog_feed, 0);
++	dog_feed(0);
++	writeb(0x64, DOG_CTRL);
++	pr_info("dev_watchdog: armed, %u s timeout, fed from a kernel timer\n", clamp(timeout, 1u, 30u));
++	return 0;
++}
++late_initcall_sync(dev_watchdog_init);

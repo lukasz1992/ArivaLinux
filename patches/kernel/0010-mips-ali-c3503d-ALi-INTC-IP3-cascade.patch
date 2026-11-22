@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:41:11 +0100
+Subject: [PATCH] mips: ali-c3503d: ALi INTC (IP3 cascade)
+
+The SoC interrupt controller (EISR 0xB8000030, EIER 0xB8000038) cascades
+into CP0 IP3; INTC bit N is Linux IRQ N+8.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile |  2 +-
+ arch/mips/ali-c3503d/irq.c    | 86 +++++++++++++++++++++++++++++++++++
+ arch/mips/ali-c3503d/setup.c  |  3 +-
+ 3 files changed, 89 insertions(+), 2 deletions(-)
+ create mode 100644 arch/mips/ali-c3503d/irq.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 84f7da01..0b29bc12 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o
++obj-y := setup.o irq.o
+diff --git a/arch/mips/ali-c3503d/irq.c b/arch/mips/ali-c3503d/irq.c
+new file mode 100644
+index 00000000..d74a32ec
+--- /dev/null
++++ b/arch/mips/ali-c3503d/irq.c
+@@ -0,0 +1,86 @@
++/*
++ * ALi C3503D interrupt controller (EISR/EIER at 0xB8000030..0xB800003C).
++ *
++ * The INTC has two 32-bit status/enable word pairs (EISR = enable and
++ * interrupt status, EIER = enable); 64 external sources, bit N cascading
++ * on CP0 IP3.  The kernel-side numbering mirrors the vendor PDK drivers
++ * and the AliSimulator device models: INTC bit N is Linux IRQ N+8 (the
++ * CPU IPs 0..7 sit below).  Known sources:
++ *   bit 16 = IRQ 24  UART0 (vendor aliuart; our port runs it polled)
++ *   bit 36 = IRQ 44  EHCI host (AliSimulator ehci_host.py, line=36, as
++ *                    driven by A54's own firmware driver)
++ *
++ * Level semantics: a source keeps its EISR bit while the device asserts
++ * it (the bit follows the line, per the simulator's _ic_set_line and the
++ * vendor read of EISR); there is no separate ack register.
++ */
++#include <linux/init.h>
++#include <linux/irq.h>
++#include <linux/io.h>
++
++#include <asm/irq_cpu.h>
++#include <asm/mipsregs.h>
++
++#include "ali.h"
++
++#define ALI_INTC_EISR0		0xB8000030UL
++#define ALI_INTC_EIER0		0xB8000038UL
++
++#define ALI_INTC_NBITS		64
++#define ALI_INTC_CASCADE_IRQ	(MIPS_CPU_IRQ_BASE + 3)
++
++static void ali_intc_cascade(struct irq_desc *desc)
++{
++	u64 pending;
++
++	pending = (u64)(readl((void __iomem *)ALI_INTC_EISR0) &
++			readl((void __iomem *)ALI_INTC_EIER0));
++	pending |= (u64)(readl((void __iomem *)(ALI_INTC_EISR0 + 4)) &
++			 readl((void __iomem *)(ALI_INTC_EIER0 + 4))) << 32;
++
++	if (!pending)
++		spurious_interrupt();
++
++	while (pending) {
++		int bit = __ffs64(pending);
++
++		generic_handle_irq(ALI_INTC_IRQ_BASE + bit);
++		pending &= ~BIT_ULL(bit);
++	}
++}
++
++void __init ali_intc_init(void)
++{
++	int i;
++
++	if (irq_alloc_descs(ALI_INTC_IRQ_BASE, ALI_INTC_IRQ_BASE, ALI_INTC_NBITS, 0) < 0)
++		panic("Failed to allocate IRQ descriptors for ALi INTC");
++
++	/* nothing the bootloader left enabled may fire before its driver asks for it */
++	writel(0, (void __iomem *)ALI_INTC_EIER0);
++	writel(0, (void __iomem *)(ALI_INTC_EIER0 + 4));
++
++	/* two 32-bit banks, masked/unmasked through their EIER word */
++	for (i = 0; i < ALI_INTC_NBITS / 32; i++) {
++		struct irq_chip_generic *gc;
++
++		gc = irq_alloc_generic_chip("ALi INTC", 1, ALI_INTC_IRQ_BASE + 32 * i,
++					    (void __iomem *)(ALI_INTC_EIER0 + 4 * i),
++					    handle_level_irq);
++		if (!gc)
++			panic("Failed to allocate generic chip for ALi INTC");
++		gc->chip_types[0].chip.irq_mask = irq_gc_mask_clr_bit;
++		gc->chip_types[0].chip.irq_unmask = irq_gc_mask_set_bit;
++		irq_setup_generic_chip(gc, IRQ_MSK(32), IRQ_GC_INIT_MASK_CACHE, 0, 0);
++	}
++	irq_set_chained_handler_and_data(ALI_INTC_CASCADE_IRQ, ali_intc_cascade, NULL);
++
++	/*
++	 * The chained handler replaces the IP3 flow and never runs the
++	 * CPU chip's unmask, so open IM3 directly (once; the CPU IRQ chip
++	 * only masks IPs around suspend, which this SoC has none of).
++	 * Userland-in-kernel-mode (P5) runs with IE|IM7 only at exec time,
++	 * so start_thread() carries IM3 into the user Status as well.
++	 */
++	set_c0_status(STATUSF_IP3);
++}
+diff --git a/arch/mips/ali-c3503d/setup.c b/arch/mips/ali-c3503d/setup.c
+index 4caf6fbc..f290d2aa 100644
+--- a/arch/mips/ali-c3503d/setup.c
++++ b/arch/mips/ali-c3503d/setup.c
+@@ -147,5 +147,6 @@ arch_initcall(ali_devices_init);
+ void __init arch_init_irq(void)
+ {
+-	/* CP0 IPs only; the ALi INTC cascades on IP3 (see irq.c). */
++	/* CP0 IPs, then the ALi INTC (EISR 0xB8000030, EIER 0xB8000038) cascading on IP3: see irq.c. */
+ 	mips_cpu_irq_init();
++	ali_intc_init();
+ }

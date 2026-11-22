@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:46:03 +0100
+Subject: [PATCH] mips: ali-c3503d: debugfs register script interpreter
+ (ali/regs)
+
+/sys/kernel/debug/ali/regs takes r8/r16/r32, w8/w16/w32, m32, dump and
+sleep lines (the format of the display-init scripts) restricted to the SoC
+register window, for bring-up without reflashing.  Not an ABI.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile |   1 +
+ arch/mips/ali-c3503d/debug.c  | 177 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 178 insertions(+)
+ create mode 100644 arch/mips/ali-c3503d/debug.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index a0e8eb69..81747b23 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -4,2 +4,3 @@
+ 
+ obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc.o i2c-scb.o otp.o
++obj-$(CONFIG_DEBUG_FS) += debug.o
+diff --git a/arch/mips/ali-c3503d/debug.c b/arch/mips/ali-c3503d/debug.c
+new file mode 100644
+index 00000000..cfdb8eba
+--- /dev/null
++++ b/arch/mips/ali-c3503d/debug.c
+@@ -0,0 +1,177 @@
++/*
++ * ALi C3503D: register script interpreter for bring-up, /sys/kernel/debug/ali/regs
++ *
++ *   w8|w16|w32 ADDR VAL      write (ADDR is a physical address 0x18000000..0x180FFFFF)
++ *   r8|r16|r32 ADDR          read, result is appended to the file's read buffer
++ *   m32 ADDR CLR SET         read-modify-write
++ *   dump ADDR LEN            hex dump of 32-bit words
++ *   sleep MS
++ *
++ * The script format is the one produced by tools/gen_display_script.py, so
++ * "cat rootfs/display-init/50-hdmi.txt > /sys/kernel/debug/ali/regs" replays
++ * a block.  Lines starting with '#' are ignored.  Not an ABI.
++ */
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <asm/addrspace.h>
++
++#define REG_BASE	0x18000000UL
++#define REG_END		0x18100000UL
++#define OUT_SZ		8192
++
++static DEFINE_MUTEX(regs_lock);
++static char out[OUT_SZ];
++static int out_len;
++static char carry[160];
++static int carry_len;
++
++static void out_printf(const char *fmt, ...)
++{
++	va_list ap;
++	int n;
++
++	if (out_len >= OUT_SZ - 1)
++		return;
++	va_start(ap, fmt);
++	n = vscnprintf(out + out_len, OUT_SZ - out_len, fmt, ap);
++	va_end(ap);
++	out_len += n;
++}
++
++static int run_line(char *l)
++{
++	char cmd[8];
++	unsigned long a, v, w;
++	int n;
++	void *p;
++
++	l = strim(l);
++	if (!*l || *l == '#')
++		return 0;
++	if (sscanf(l, "%7s", cmd) != 1)
++		return -EINVAL;
++	l += strlen(cmd);
++
++	if (!strcmp(cmd, "sleep")) {
++		if (kstrtoul(strim(l), 0, &v))
++			return -EINVAL;
++		msleep(v);
++		return 0;
++	}
++	n = sscanf(l, "%lx %lx %lx", &a, &v, &w);
++	if (n < 1 || a < REG_BASE || a >= REG_END)
++		return -EINVAL;
++	p = (void *)CKSEG1ADDR(a);
++
++	if (!strcmp(cmd, "w32") && n >= 2 && !(a & 3)) {
++		*(volatile u32 *)p = v;
++	} else if (!strcmp(cmd, "w16") && n >= 2 && !(a & 1)) {
++		*(volatile u16 *)p = v;
++	} else if (!strcmp(cmd, "w8") && n >= 2) {
++		*(volatile u8 *)p = v;
++	} else if (!strcmp(cmd, "r32") && !(a & 3)) {
++		out_printf("%08lx: %08x\n", a, *(volatile u32 *)p);
++	} else if (!strcmp(cmd, "r16") && !(a & 1)) {
++		out_printf("%08lx: %04x\n", a, *(volatile u16 *)p);
++	} else if (!strcmp(cmd, "r8")) {
++		out_printf("%08lx: %02x\n", a, *(volatile u8 *)p);
++	} else if (!strcmp(cmd, "m32") && n >= 3 && !(a & 3)) {
++		u32 x = *(volatile u32 *)p;
++
++		*(volatile u32 *)p = (x & ~v) | w;
++	} else if (!strcmp(cmd, "dump") && n >= 2 && !(a & 3)) {
++		unsigned long i;
++
++		if (a + v > REG_END)
++			return -EINVAL;
++		for (i = 0; i < v; i += 4) {
++			if (!(i & 15))
++				out_printf("%s%08lx:", i ? "\n" : "", a + i);
++			out_printf(" %08x", *(volatile u32 *)(p + i));
++		}
++		out_printf("\n");
++	} else {
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static ssize_t regs_write(struct file *f, const char __user *ubuf, size_t len, loff_t *pos)
++{
++	char *buf, *s, *nl;
++	int ret = 0, lineno = 0;
++	size_t total;
++
++	if (len > 65536)
++		return -E2BIG;
++	buf = kmalloc(len + sizeof(carry) + 1, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	mutex_lock(&regs_lock);
++	if (copy_from_user(buf + carry_len, ubuf, len)) {
++		mutex_unlock(&regs_lock);
++		kfree(buf);
++		return -EFAULT;
++	}
++	memcpy(buf, carry, carry_len);
++	total = carry_len + len;
++	carry_len = 0;
++	buf[total] = 0;
++	if (!*pos)
++		out_len = 0;
++	s = buf;
++	while ((nl = strchr(s, '\n'))) {
++		*nl = 0;
++		lineno++;
++		ret = run_line(s);
++		if (ret) {
++			pr_err("ali/regs: bad line %d: '%s'\n", lineno, s);
++			goto out;
++		}
++		s = nl + 1;
++	}
++	if (*s) {		/* partial last line: a following write() may complete it */
++		size_t r = strlen(s);
++
++		if (r < sizeof(carry)) {
++			memcpy(carry, s, r);
++			carry_len = r;
++		} else {
++			ret = -E2BIG;
++		}
++	}
++out:
++	mutex_unlock(&regs_lock);
++	kfree(buf);
++	return ret ? ret : len;
++}
++
++static ssize_t regs_read(struct file *f, char __user *ubuf, size_t len, loff_t *pos)
++{
++	return simple_read_from_buffer(ubuf, len, pos, out, out_len);
++}
++
++static const struct file_operations regs_fops = {
++	.owner	= THIS_MODULE,
++	.read	= regs_read,
++	.write	= regs_write,
++	.llseek	= default_llseek,
++};
++
++static int __init ali_debug_init(void)
++{
++	struct dentry *d = debugfs_create_dir("ali", NULL);
++
++	if (!d)
++		return -ENOMEM;
++	debugfs_create_file("regs", 0600, d, NULL, &regs_fops);
++	return 0;
++}
++late_initcall(ali_debug_init);

@@ -1,0 +1,527 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:42:16 +0100
+Subject: [PATCH] auxdisplay: fd650: FD650K/TM1650 front-panel driver
+
+Seven-segment display, key matrix and LEDs of the FD650K panel chip over
+i2c; the wiring (digit order, segment map, keys, LEDs) comes from platform
+data, so any board using the chip can describe its panel.  Keys are polled
+into an input device, LEDs are exposed through the LED class.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/auxdisplay/Kconfig          |  13 +
+ drivers/auxdisplay/Makefile         |   1 +
+ drivers/auxdisplay/fd650.c          | 426 ++++++++++++++++++++++++++++
+ include/linux/platform_data/fd650.h |  40 +++
+ 4 files changed, 480 insertions(+)
+ create mode 100644 drivers/auxdisplay/fd650.c
+ create mode 100644 include/linux/platform_data/fd650.h
+
+diff --git a/drivers/auxdisplay/Kconfig b/drivers/auxdisplay/Kconfig
+index c07e725e..4788aa7d 100644
+--- a/drivers/auxdisplay/Kconfig
++++ b/drivers/auxdisplay/Kconfig
+@@ -120,3 +120,16 @@ config CFAG12864B_RATE
+ 	  value using the module parameters.
+ 
++config FD650
++	tristate "FD650/TM1650 4-digit LED display and key scanner"
++	depends on I2C && INPUT && LEDS_CLASS
++	select INPUT_POLLDEV
++	---help---
++	  Front-panel controller found on set-top boxes (e.g. Ferguson
++	  Ariva): four 7-segment digits, LEDs on the decimal-point lines and
++	  a key matrix, on a two-wire bus driven by an I2C adapter.  The
++	  board passes the wiring as platform data (linux/platform_data/fd650.h).
++
++	  To compile this as a module, choose M here: the module will be
++	  called fd650.
++
+ endif # AUXDISPLAY
+diff --git a/drivers/auxdisplay/Makefile b/drivers/auxdisplay/Makefile
+index 8a8936a4..4f5c902c 100644
+--- a/drivers/auxdisplay/Makefile
++++ b/drivers/auxdisplay/Makefile
+@@ -5,2 +5,3 @@
+ obj-$(CONFIG_KS0108)		+= ks0108.o
+ obj-$(CONFIG_CFAG12864B)	+= cfag12864b.o cfag12864bfb.o
++obj-$(CONFIG_FD650)		+= fd650.o
+diff --git a/drivers/auxdisplay/fd650.c b/drivers/auxdisplay/fd650.c
+new file mode 100644
+index 00000000..4408ede5
+--- /dev/null
++++ b/drivers/auxdisplay/fd650.c
+@@ -0,0 +1,426 @@
++/*
++ * FD650 / TM1650 4-digit LED display and key scanner.
++ *
++ * The chip sits on a 2-wire bus that looks like I2C without a real slave
++ * address: every transaction is "address byte, data byte", and the
++ * "addresses" select the register (the 8-bit bus bytes, i.e. the 7-bit
++ * I2C addresses 0x24, 0x34..0x37 and 0x27):
++ *
++ *   0x48 + data    display control: bit 0 = on, bits 4..6 = brightness
++ *   0x68/6A/6C/6E  digit registers (the segment byte)
++ *   0x4F (read)    key scan: bit 6 = pressed, bits 5..3 = row KI-1,
++ *                  bits 1..0 = column DIG-1
++ *
++ * Board wiring (which register shows which position, which bit of the
++ * digit byte drives which segment, the keys and the LEDs on the DP lines)
++ * comes from struct fd650_platform_data.
++ *
++ * Userland interface:
++ *   <platform device>/display     4 characters (7-segment font below)
++ *   <platform device>/brightness  0..7 (written to control bits 4..6)
++ *   /sys/class/leds/<name>        LEDs wired to a digit's DP line
++ *   an input device for the keys, polled while it is open
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation.
++ */
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/input-polldev.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_data/fd650.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/sysfs.h>
++#include <linux/workqueue.h>
++
++#define FD650_ADDR_CTRL		0x48
++#define FD650_ADDR_DIG0		0x68	/* 0x68, 0x6A, 0x6C, 0x6E */
++#define FD650_ADDR_KEY		0x4F	/* LSB = 1: a read */
++
++#define FD650_CTRL_ON		0x01
++#define FD650_KEY_PRESSED	0x40
++#define FD650_SEG_DP		7
++
++struct fd650;
++
++struct fd650_led_dev {
++	struct led_classdev cdev;
++	struct fd650 *fd;
++	u8 reg;
++	bool on;
++};
++
++struct fd650 {
++	struct device *dev;
++	const struct fd650_platform_data *pdata;
++	struct i2c_adapter *adap;
++	struct input_polled_dev *poll;
++	struct fd650_led_dev *leds;
++	struct work_struct led_work;
++	struct mutex lock;		/* text, brightness, LED state, display writes */
++	char text[5];
++	u8 brightness;
++	u16 last_key;
++};
++
++/*
++ * The universal 7-segment font (bit 0..6 = a..g, bit 7 = DP): digits, the
++ * letters a set-top box panel spells (" On ", "oFF ", "boot", "Lnb"...)
++ * and the dash.  Unknown characters come out blank.
++ */
++struct fd650_font {
++	char ch;
++	u8 seg;
++};
++
++static const struct fd650_font fd650_font[] = {
++	{ ' ', 0x00 }, { '-', 0x40 }, { '.', 0x80 },
++	{ '0', 0x3F }, { '1', 0x06 }, { '2', 0x5B }, { '3', 0x4F },
++	{ '4', 0x66 }, { '5', 0x6D }, { '6', 0x7D }, { '7', 0x07 },
++	{ '8', 0x7F }, { '9', 0x6F },
++	{ 'a', 0x5F }, { 'b', 0x7C }, { 'c', 0x58 }, { 'd', 0x5E },
++	{ 'e', 0x7B }, { 'f', 0x71 }, { 'h', 0x74 }, { 'i', 0x10 },
++	{ 'l', 0x38 }, { 'n', 0x54 }, { 'o', 0x5C }, { 'p', 0x73 },
++	{ 'r', 0x50 }, { 's', 0x6D }, { 't', 0x78 }, { 'u', 0x1C },
++	{ 'y', 0x6E },
++	{ 'A', 0x77 }, { 'C', 0x39 }, { 'D', 0x5E }, { 'E', 0x79 },
++	{ 'F', 0x71 }, { 'I', 0x30 }, { 'L', 0x38 }, { 'N', 0x37 },
++	{ 'O', 0x3F }, { 'P', 0x73 }, { 'S', 0x6D }, { 'U', 0x3E },
++	{ 'Y', 0x6E },
++};
++
++static u8 fd650_font_lookup(char ch)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(fd650_font); i++)
++		if (fd650_font[i].ch == ch)
++			return fd650_font[i].seg;
++	return 0x00;
++}
++
++/* ---- the bus ---- */
++
++/* The register "addresses" are 8-bit bus bytes: 7-bit address = byte >> 1. */
++static int fd650_write(struct fd650 *fd, u8 addr, u8 data)
++{
++	struct i2c_msg msg = { .addr = addr >> 1, .len = 1, .buf = &data };
++	int ret = i2c_transfer(fd->adap, &msg, 1);
++
++	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++static int fd650_read_key(struct fd650 *fd, u8 *key)
++{
++	struct i2c_msg msg = {
++		.addr = FD650_ADDR_KEY >> 1, .flags = I2C_M_RD,
++		.len = 1, .buf = key,
++	};
++	int ret = i2c_transfer(fd->adap, &msg, 1);
++
++	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++/* ---- display (callers hold fd->lock) ---- */
++
++static u8 fd650_raw(struct fd650 *fd, u8 std)
++{
++	u8 raw = 0;
++	int seg;
++
++	for (seg = 0; seg < 8; seg++)
++		if (std & BIT(seg))
++			raw |= BIT(fd->pdata->seg_map[seg]);
++	return raw;
++}
++
++static int fd650_render(struct fd650 *fd)
++{
++	const struct fd650_platform_data *pdata = fd->pdata;
++	int pos, ret = 0;
++	unsigned int i;
++
++	for (pos = 0; pos < 4; pos++) {
++		u8 reg = pdata->digit_reg[pos];
++		u8 std = fd650_font_lookup(fd->text[pos]);
++		int err;
++
++		/* an LED on this register's DP line lights it */
++		for (i = 0; i < pdata->nleds; i++)
++			if (fd->leds[i].reg == reg && fd->leds[i].on)
++				std |= BIT(FD650_SEG_DP);
++
++		err = fd650_write(fd, FD650_ADDR_DIG0 + 2 * reg, fd650_raw(fd, std));
++		if (err && !ret)
++			ret = err;
++	}
++	return ret;
++}
++
++static int fd650_set_brightness(struct fd650 *fd, u8 level)
++{
++	return fd650_write(fd, FD650_ADDR_CTRL, (level << 4) | FD650_CTRL_ON);
++}
++
++/* ---- LEDs: the LED core may call brightness_set from atomic context ---- */
++
++static void fd650_led_work(struct work_struct *work)
++{
++	struct fd650 *fd = container_of(work, struct fd650, led_work);
++
++	mutex_lock(&fd->lock);
++	fd650_render(fd);
++	mutex_unlock(&fd->lock);
++}
++
++static void fd650_led_set(struct led_classdev *cdev, enum led_brightness value)
++{
++	struct fd650_led_dev *led = container_of(cdev, struct fd650_led_dev, cdev);
++
++	led->on = value != LED_OFF;
++	schedule_work(&led->fd->led_work);
++}
++
++/* ---- keys ---- */
++
++static void fd650_poll(struct input_polled_dev *poll)
++{
++	struct fd650 *fd = poll->private;
++	const struct fd650_platform_data *pdata = fd->pdata;
++	u16 code = 0;
++	unsigned int i;
++	u8 key;
++
++	if (fd650_read_key(fd, &key))
++		key = 0;			/* a bus error reads as released */
++
++	if (key & FD650_KEY_PRESSED) {
++		u8 row = ((key >> 3) & 7) + 1;
++		u8 col = (key & 3) + 1;
++
++		for (i = 0; i < pdata->nkeys; i++)
++			if (pdata->keys[i].row == row && pdata->keys[i].col == col)
++				code = pdata->keys[i].code;
++	}
++
++	if (code != fd->last_key) {
++		if (fd->last_key)
++			input_report_key(poll->input, fd->last_key, 0);
++		if (code)
++			input_report_key(poll->input, code, 1);
++		input_sync(poll->input);
++		fd->last_key = code;
++	}
++}
++
++/* ---- sysfs ---- */
++
++static ssize_t display_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct fd650 *fd = dev_get_drvdata(dev);
++	ssize_t n;
++
++	mutex_lock(&fd->lock);
++	n = scnprintf(buf, PAGE_SIZE, "%s\n", fd->text);
++	mutex_unlock(&fd->lock);
++	return n;
++}
++
++static ssize_t display_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct fd650 *fd = dev_get_drvdata(dev);
++	size_t n = min_t(size_t, count, 4);
++	int i, ret;
++
++	mutex_lock(&fd->lock);
++	memset(fd->text, ' ', 4);
++	memcpy(fd->text, buf, n);
++	for (i = 0; i < 4; i++)
++		if (fd->text[i] == '\n' || fd->text[i] == '\r' || fd->text[i] == '\0')
++			fd->text[i] = ' ';
++	ret = fd650_render(fd);
++	mutex_unlock(&fd->lock);
++	if (ret)
++		return ret;
++	return count;
++}
++
++static ssize_t brightness_show(struct device *dev, struct device_attribute *attr,
++			       char *buf)
++{
++	struct fd650 *fd = dev_get_drvdata(dev);
++
++	return scnprintf(buf, PAGE_SIZE, "%u\n", fd->brightness);
++}
++
++static ssize_t brightness_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct fd650 *fd = dev_get_drvdata(dev);
++	unsigned long level;
++	int ret;
++
++	ret = kstrtoul(buf, 10, &level);
++	if (ret)
++		return ret;
++	if (level > 7)
++		return -EINVAL;
++
++	mutex_lock(&fd->lock);
++	ret = fd650_set_brightness(fd, level);
++	if (!ret)
++		fd->brightness = level;
++	mutex_unlock(&fd->lock);
++	if (ret)
++		return ret;
++	return count;
++}
++
++static DEVICE_ATTR_RW(display);
++static DEVICE_ATTR_RW(brightness);
++
++static struct attribute *fd650_attrs[] = {
++	&dev_attr_display.attr,
++	&dev_attr_brightness.attr,
++	NULL,
++};
++
++static const struct attribute_group fd650_attr_group = {
++	.attrs = fd650_attrs,
++};
++
++/* ---- driver ---- */
++
++/*
++ * Runs after the managed LEDs and input device are gone (devres releases
++ * in reverse order): the LED core's final "off" may still have queued the
++ * LED work, so flush it while the adapter is still held.
++ */
++static void fd650_teardown(void *data)
++{
++	struct fd650 *fd = data;
++
++	cancel_work_sync(&fd->led_work);
++	fd650_write(fd, FD650_ADDR_CTRL, 0);	/* display off */
++	i2c_put_adapter(fd->adap);
++}
++
++static int fd650_probe(struct platform_device *pdev)
++{
++	const struct fd650_platform_data *pdata = dev_get_platdata(&pdev->dev);
++	struct input_polled_dev *poll;
++	struct fd650 *fd;
++	unsigned int i;
++	int ret;
++
++	if (!pdata || pdata->brightness > 7)
++		return -EINVAL;
++	for (i = 0; i < 4; i++)
++		if (pdata->digit_reg[i] > 3)
++			return -EINVAL;
++	for (i = 0; i < 8; i++)
++		if (pdata->seg_map[i] > 7)
++			return -EINVAL;
++	for (i = 0; i < pdata->nleds; i++)
++		if (pdata->leds[i].reg > 3)
++			return -EINVAL;
++
++	fd = devm_kzalloc(&pdev->dev, sizeof(*fd), GFP_KERNEL);
++	if (!fd)
++		return -ENOMEM;
++	fd->leds = devm_kcalloc(&pdev->dev, pdata->nleds, sizeof(*fd->leds),
++				GFP_KERNEL);
++	if (pdata->nleds && !fd->leds)
++		return -ENOMEM;
++	fd->dev = &pdev->dev;
++	fd->pdata = pdata;
++	mutex_init(&fd->lock);
++	INIT_WORK(&fd->led_work, fd650_led_work);
++	memset(fd->text, ' ', 4);
++	if (pdata->boot_text)
++		memcpy(fd->text, pdata->boot_text,
++		       min_t(size_t, strlen(pdata->boot_text), 4));
++	fd->brightness = pdata->brightness;
++	platform_set_drvdata(pdev, fd);
++
++	fd->adap = i2c_get_adapter(pdata->i2c_bus);
++	if (!fd->adap)
++		return -EPROBE_DEFER;		/* the panel bus is not up yet */
++	ret = devm_add_action(&pdev->dev, fd650_teardown, fd);
++	if (ret) {
++		i2c_put_adapter(fd->adap);
++		return ret;
++	}
++
++	mutex_lock(&fd->lock);
++	ret = fd650_set_brightness(fd, fd->brightness);
++	if (!ret)
++		ret = fd650_render(fd);
++	mutex_unlock(&fd->lock);
++	if (ret)
++		dev_warn(&pdev->dev, "panel does not answer on i2c-%d: %d\n",
++			 pdata->i2c_bus, ret);
++
++	for (i = 0; i < pdata->nleds; i++) {
++		struct fd650_led_dev *led = &fd->leds[i];
++
++		led->fd = fd;
++		led->reg = pdata->leds[i].reg;
++		led->cdev.name = pdata->leds[i].name;
++		led->cdev.default_trigger = pdata->leds[i].default_trigger;
++		led->cdev.max_brightness = 1;
++		led->cdev.brightness_set = fd650_led_set;
++		ret = devm_led_classdev_register(&pdev->dev, &led->cdev);
++		if (ret)
++			return ret;
++	}
++
++	poll = devm_input_allocate_polled_device(&pdev->dev);
++	if (!poll)
++		return -ENOMEM;
++	fd->poll = poll;
++	poll->private = fd;
++	poll->poll = fd650_poll;
++	poll->poll_interval = pdata->poll_ms ? pdata->poll_ms : 50;
++	poll->input->name = "fd650 front-panel keys";
++	poll->input->phys = "fd650/input0";
++	poll->input->id.bustype = BUS_I2C;
++	for (i = 0; i < pdata->nkeys; i++)
++		input_set_capability(poll->input, EV_KEY, pdata->keys[i].code);
++	ret = input_register_polled_device(poll);
++	if (ret)
++		return ret;
++
++	ret = sysfs_create_group(&pdev->dev.kobj, &fd650_attr_group);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev, "FD650 panel on i2c-%d\n", pdata->i2c_bus);
++	return 0;
++}
++
++static int fd650_remove(struct platform_device *pdev)
++{
++	sysfs_remove_group(&pdev->dev.kobj, &fd650_attr_group);
++	return 0;
++}
++
++static struct platform_driver fd650_driver = {
++	.probe		= fd650_probe,
++	.remove		= fd650_remove,
++	.driver		= {
++		.name	= "fd650",
++	},
++};
++module_platform_driver(fd650_driver);
++
++MODULE_DESCRIPTION("FD650/TM1650 LED display and key scanner");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:fd650");
+diff --git a/include/linux/platform_data/fd650.h b/include/linux/platform_data/fd650.h
+new file mode 100644
+index 00000000..91c08b3b
+--- /dev/null
++++ b/include/linux/platform_data/fd650.h
+@@ -0,0 +1,40 @@
++/*
++ * FD650 / TM1650 4-digit LED display and key scanner: board data.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation.
++ */
++#ifndef __LINUX_PLATFORM_DATA_FD650_H
++#define __LINUX_PLATFORM_DATA_FD650_H
++
++#include <linux/types.h>
++
++/* A key at row KI (1..8) and column DIG (1..4) of the scan matrix. */
++struct fd650_key {
++	u8 row;
++	u8 col;
++	u16 code;			/* input key code */
++};
++
++/* An LED wired to the DP line of one digit register (0..3). */
++struct fd650_led {
++	const char *name;
++	const char *default_trigger;
++	u8 reg;
++};
++
++struct fd650_platform_data {
++	int i2c_bus;			/* adapter number of the panel bus */
++	u8 digit_reg[4];		/* display position -> digit register */
++	u8 seg_map[8];			/* segment a..g, DP -> bit of the digit byte */
++	const struct fd650_key *keys;
++	unsigned int nkeys;
++	const struct fd650_led *leds;
++	unsigned int nleds;
++	unsigned int poll_ms;		/* key scan period */
++	u8 brightness;			/* initial, 0..7 */
++	const char *boot_text;		/* up to 4 characters, NULL = blank */
++};
++
++#endif

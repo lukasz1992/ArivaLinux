@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:46:02 +0100
+Subject: [PATCH] mips: ali-c3503d: RTC
+
+Battery-backed clock at 0x18018A00 with packed date/time registers (the
+weekday is stored as 1..7, Sunday = 7).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile |   2 +-
+ arch/mips/ali-c3503d/rtc.c    | 166 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 167 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/rtc.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 6bf5b7d6..6cc15ef2 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc.o
+diff --git a/arch/mips/ali-c3503d/rtc.c b/arch/mips/ali-c3503d/rtc.c
+new file mode 100644
+index 00000000..5c046ece
+--- /dev/null
++++ b/arch/mips/ali-c3503d/rtc.c
+@@ -0,0 +1,166 @@
++/*
++ * ALi C3503D real-time clock, Ferguson Ariva 54.
++ *
++ * Registers at 0xB8018A00 (kseg1 view), the layout reverse-engineered
++ * from the ALi SDK's RTC driver (the simulator's rtc_m36.py; the newer
++ * SDK revisions move it to 0xB8018F00 -- same layout):
++ *
++ *   +0  write: load the time, bit 31 set, the fields packed as below
++ *   +4  read: the running time in the same layout
++ *
++ * The packed word (bit 31 set marks a load on writes):
++ *   bits 29..30 year's two low bits (the leap-year cycle)
++ *   bits 25..28 month, bits 20..24 day, bits 17..19 weekday (1..7, Monday = 1)
++ *   bits 12..16 hour, bits 6..11 minute, bits 0..5 second
++ *
++ * The hardware keeps only the year's two low bits, so the driver keeps
++ * the century in software: year_base is the last year seen (set by userland,
++ * or the one a read returned) and a read gives the first year >= year_base
++ * whose two low bits are yy -- the clock only runs forward, so it stays right
++ * as long as it is read (or set by NTP) at least once every 4 years.
++ * After a power-up with a never-set clock the base is ALI_RTC_BASE_YEAR.  The alarm registers exist
++ * (interrupt 30) but are not wired here yet.
++ */
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/rtc.h>
++#include <linux/bcd.h>
++
++#include "ali.h"
++
++#define ALI_RTC_BASE_YEAR	2026	/* earliest year assumed at power-up; bump on release */
++
++#define ALI_RTC_BASE		0xB8018A00UL
++
++struct ali_rtc {
++	void __iomem *regs;
++	struct rtc_device *rtc;
++	int year_base;
++	spinlock_t lock;
++};
++
++static u32 ali_rtc_pack(const struct rtc_time *tm)
++{
++	return ((u32)(tm->tm_year & 3) << 29) |
++	       ((u32)(tm->tm_mon + 1) << 25) |
++	       ((u32)tm->tm_mday << 20) |
++	       ((u32)(tm->tm_wday ? tm->tm_wday : 7) << 17) |
++	       ((u32)tm->tm_hour << 12) |
++	       ((u32)tm->tm_min << 6) |
++	       (u32)tm->tm_sec;
++}
++
++static void ali_rtc_unpack(u32 r, struct rtc_time *tm)
++{
++	tm->tm_sec = r & 0x3F;
++	tm->tm_min = (r >> 6) & 0x3F;
++	tm->tm_hour = (r >> 12) & 0x1F;
++	tm->tm_wday = ((r >> 17) & 0x7) % 7;	/* 7 (Sunday) -> 0 */
++	tm->tm_mday = (r >> 20) & 0x1F;
++	tm->tm_mon = ((r >> 25) & 0xF) - 1;
++	tm->tm_year = (r >> 29) & 0x3;		/* completed by the caller */
++}
++
++static int ali_rtc_read_time(struct device *dev, struct rtc_time *tm)
++{
++	struct ali_rtc *rtc = dev_get_drvdata(dev);
++	u32 r;
++	unsigned long flags;
++	int year;
++
++	spin_lock_irqsave(&rtc->lock, flags);
++	r = readl(rtc->regs + 4);
++	ali_rtc_unpack(r, tm);			/* tm_year = yy for now */
++	year = rtc->year_base + ((tm->tm_year - rtc->year_base) & 3);
++	rtc->year_base = year;			/* never goes back: keeps the cycle across reads */
++	spin_unlock_irqrestore(&rtc->lock, flags);
++
++	tm->tm_year = year - 1900;
++	return 0;
++}
++
++static int ali_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++	struct ali_rtc *rtc = dev_get_drvdata(dev);
++	unsigned long flags;
++
++	if (tm->tm_year + 1900 < 1900)
++		return -EINVAL;
++
++	spin_lock_irqsave(&rtc->lock, flags);
++	writel(0x80000000u | ali_rtc_pack(tm), rtc->regs);
++	rtc->year_base = tm->tm_year + 1900;
++	spin_unlock_irqrestore(&rtc->lock, flags);
++	return 0;
++}
++
++static const struct rtc_class_ops ali_rtc_ops = {
++	.read_time = ali_rtc_read_time,
++	.set_time = ali_rtc_set_time,
++};
++
++static int ali_rtc_probe(struct platform_device *pdev)
++{
++	struct ali_rtc *rtc;
++	struct resource *res;
++	struct rtc_time tm;
++	int ret;
++
++	rtc = devm_kzalloc(&pdev->dev, sizeof(*rtc), GFP_KERNEL);
++	if (!rtc)
++		return -ENOMEM;
++	spin_lock_init(&rtc->lock);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	rtc->regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(rtc->regs))
++		return PTR_ERR(rtc->regs);
++
++	platform_set_drvdata(pdev, rtc);
++
++	rtc->year_base = ALI_RTC_BASE_YEAR;
++	ali_rtc_read_time(&pdev->dev, &tm);
++	if (tm.tm_mon < 0 || tm.tm_mon > 11 || tm.tm_mday == 0) {
++		/* the clock was never loaded (reads 0): start at a sane time
++		 * so HCTOSYS gets a valid date */
++		rtc_time_to_tm(1767225600, &tm);	/* 2026-01-01 */
++		rtc->year_base = ALI_RTC_BASE_YEAR;
++		ali_rtc_set_time(&pdev->dev, &tm);
++	}
++
++	rtc->rtc = devm_rtc_device_register(&pdev->dev, "ali-rtc",
++					    &ali_rtc_ops, THIS_MODULE);
++	if (IS_ERR(rtc->rtc)) {
++		ret = PTR_ERR(rtc->rtc);
++		dev_err(&pdev->dev, "failed to register rtc: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(&pdev->dev, "rtc at %pR, year base %d\n", res, rtc->year_base);
++	return 0;
++}
++
++static struct platform_driver ali_rtc_driver = {
++	.probe = ali_rtc_probe,
++	.driver = {
++		.name = "ali-rtc",
++		.owner = THIS_MODULE,
++	},
++};
++
++static int __init ali_rtc_init(void)
++{
++	return platform_driver_register(&ali_rtc_driver);
++}
++/* not subsys_initcall: the RTC class itself is one (linked later), and a device registered before it ends up outside the class, invisible to HCTOSYS */
++device_initcall(ali_rtc_init);
++
++static int __init ali_rtc_add(void)
++{
++	const struct resource rtc = DEFINE_RES_MEM(0x18018A00UL, 0x10);
++
++	ali_add("ali-rtc", -1, &rtc, 1);
++	return 0;
++}
++arch_initcall(ali_rtc_add);

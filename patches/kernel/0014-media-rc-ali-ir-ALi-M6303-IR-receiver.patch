@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:41:51 +0100
+Subject: [PATCH] media: rc: ali-ir: ALi M6303 IR receiver
+
+The controller queues one byte per mark/space run (bit 7 the level, bits
+0..6 the length in 8 us ticks); the driver feeds them to rc-core as raw
+events for the NEC decoder.  The keymap is chosen by platform data, so the
+driver is not tied to one remote.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile        |   2 +-
+ arch/mips/ali-c3503d/ali.h           |   1 +
+ arch/mips/ali-c3503d/dev-ir.c        |  24 +++++
+ drivers/media/rc/Kconfig             |   8 ++
+ drivers/media/rc/Makefile            |   1 +
+ drivers/media/rc/ali-ir.c            | 153 +++++++++++++++++++++++++++
+ include/linux/platform_data/ali-ir.h |   9 ++
+ 7 files changed, 197 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/dev-ir.c
+ create mode 100644 drivers/media/rc/ali-ir.c
+ create mode 100644 include/linux/platform_data/ali-ir.h
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index fdf3a0fd..c170fc88 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o
+diff --git a/arch/mips/ali-c3503d/ali.h b/arch/mips/ali-c3503d/ali.h
+index 219ebda6..edc1604a 100644
+--- a/arch/mips/ali-c3503d/ali.h
++++ b/arch/mips/ali-c3503d/ali.h
+@@ -27,4 +27,5 @@ struct ali_board {
+ 	const struct mtd_partition *flash_parts;
+ 	unsigned int nr_flash_parts;
++	const char *ir_map;			/* rc keymap (RC_MAP_*) of the board's remote */
+ 	void (*init)(void);			/* register board-specific devices */
+ };
+diff --git a/arch/mips/ali-c3503d/dev-ir.c b/arch/mips/ali-c3503d/dev-ir.c
+new file mode 100644
+index 00000000..4bf61fd0
+--- /dev/null
++++ b/arch/mips/ali-c3503d/dev-ir.c
+@@ -0,0 +1,24 @@
++/*
++ * ALi C3503D IR receiver (M6303 IRC) platform device
++ *
++ * The remote's keymap is a property of the board: ali_board.ir_map.
++ */
++#include <linux/init.h>
++#include <linux/platform_data/ali-ir.h>
++#include <linux/platform_device.h>
++
++#include "ali.h"
++
++static int __init ali_ir_init(void)
++{
++	const struct resource ir[] = {
++		DEFINE_RES_MEM(0x18018100UL, 0x10),
++		DEFINE_RES_IRQ(ALI_INTC_IRQ_BASE + 19),		/* INTC bit 19 */
++	};
++	struct ali_ir_platform_data data = { .map_name = ali_board.ir_map };
++
++	WARN_ON(IS_ERR(platform_device_register_resndata(NULL, "ali-ir", -1,
++			ir, ARRAY_SIZE(ir), &data, sizeof(data))));
++	return 0;
++}
++arch_initcall(ali_ir_init);
+diff --git a/drivers/media/rc/Kconfig b/drivers/media/rc/Kconfig
+index b6e13116..fe9c21f6 100644
+--- a/drivers/media/rc/Kconfig
++++ b/drivers/media/rc/Kconfig
+@@ -359,4 +359,12 @@ config RC_LOOPBACK
+ 	   be called rc_loopback.
+ 
++config IR_ALI
++	tristate "ALi M6303 IR receiver (C3503D)"
++	depends on RC_CORE
++	depends on MIPS_ALI_C3503D || COMPILE_TEST
++	---help---
++	   Say Y here for the IR receiver of the ALi C3503D (Ferguson
++	   Ariva 54); includes the Ariva remote's keymap.
++
+ config IR_GPIO_CIR
+ 	tristate "GPIO IR remote control"
+diff --git a/drivers/media/rc/Makefile b/drivers/media/rc/Makefile
+index 379a5c0f..ebced2d0 100644
+--- a/drivers/media/rc/Makefile
++++ b/drivers/media/rc/Makefile
+@@ -31,4 +31,5 @@ obj-$(CONFIG_IR_STREAMZAP) += streamzap.o
+ obj-$(CONFIG_IR_WINBOND_CIR) += winbond-cir.o
+ obj-$(CONFIG_RC_LOOPBACK) += rc-loopback.o
++obj-$(CONFIG_IR_ALI) += ali-ir.o
+ obj-$(CONFIG_IR_GPIO_CIR) += gpio-ir-recv.o
+ obj-$(CONFIG_IR_IGORPLUGUSB) += igorplugusb.o
+diff --git a/drivers/media/rc/ali-ir.c b/drivers/media/rc/ali-ir.c
+new file mode 100644
+index 00000000..114add5a
+--- /dev/null
++++ b/drivers/media/rc/ali-ir.c
+@@ -0,0 +1,153 @@
++/*
++ * ALi M6303 IR receiver (IRC, 0x18018100 on the C3503D / Ferguson Ariva 54).
++ *
++ * The controller measures the receiver output and queues one byte per run
++ * in a FIFO: bit 7 the line level (0 = mark, the receiver is active low),
++ * bits 0..6 the length in 8 us work-clock ticks (a longer run takes several
++ * bytes of the same level).  ISR bit 0 = FIFO over threshold, bit 1 = the
++ * line stayed idle for the timeout (a frame ended); write 1 to clear.
++ * Set-up as the vendor's irc_m6303irc_init / the A54 firmware (IRCCFG 0x83);
++ * see also maciej_app demo/ir.c.  Runs go to rc-core as raw pulse/space
++ * events; rc-core's NEC decoder and the keymap named by the platform data
++ * turn them into keys.
++ *
++ * Licensed under the GPLv2.
++ */
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/platform_data/ali-ir.h>
++#include <media/rc-core.h>
++
++#define IRC_CFG		0
++#define IRC_FIFOCTRL	1
++#define IRC_TIMETHR	2
++#define IRC_NOISETHR	3
++#define IRC_IER		6
++#define IRC_ISR		7
++#define IRC_RLC		8
++
++#define TICK_US		8
++#define IDLE_US		24000
++
++struct ali_ir {
++	void __iomem *base;
++	struct rc_dev *rc;
++};
++
++static irqreturn_t ali_ir_irq(int irq, void *data)
++{
++	struct ali_ir *ir = data;
++	u8 st, n;
++	int budget = 128;		/* never spin in the handler if FIFOCTRL does not drain */
++
++	st = readb(ir->base + IRC_ISR) & 3;
++	if (!st)
++		return IRQ_NONE;
++	writeb(st, ir->base + IRC_ISR);
++	while (budget && (n = readb(ir->base + IRC_FIFOCTRL) & 0x7f)) {
++		while (n-- && budget) {
++			u8 b = readb(ir->base + IRC_RLC);
++			DEFINE_IR_RAW_EVENT(ev);
++
++			ev.pulse = !(b & 0x80);
++			ev.duration = US_TO_NS((b & 0x7f) * TICK_US);
++			ir_raw_event_store_with_filter(ir->rc, &ev);
++			budget--;
++		}
++	}
++	if (st & 2) {			/* frame over: the idle timeout */
++		DEFINE_IR_RAW_EVENT(ev);
++
++		ev.pulse = false;
++		ev.duration = US_TO_NS(IDLE_US);
++		ir_raw_event_store_with_filter(ir->rc, &ev);
++		ir_raw_event_set_idle(ir->rc, true);
++	}
++	ir_raw_event_handle(ir->rc);
++	return IRQ_HANDLED;
++}
++
++static void ali_ir_hw_init(struct ali_ir *ir)
++{
++	writeb(0, ir->base + IRC_CFG);
++	writeb(0x80 | 3, ir->base + IRC_CFG);			/* on, 8 us ticks */
++	writeb(0xa0, ir->base + IRC_FIFOCTRL);			/* threshold 32 */
++	writeb(IDLE_US / (TICK_US << 7) - 1, ir->base + IRC_TIMETHR);
++	writeb(80 / TICK_US, ir->base + IRC_NOISETHR);		/* < 80 us = noise */
++	writeb(3, ir->base + IRC_ISR);
++	writeb(3, ir->base + IRC_IER);
++}
++
++static int ali_ir_probe(struct platform_device *pdev)
++{
++	struct ali_ir *ir;
++	struct resource *res;
++	struct rc_dev *rc;
++	const struct ali_ir_platform_data *pdata = dev_get_platdata(&pdev->dev);
++	int irq, ret;
++
++	ir = devm_kzalloc(&pdev->dev, sizeof(*ir), GFP_KERNEL);
++	if (!ir)
++		return -ENOMEM;
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	ir->base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(ir->base))
++		return PTR_ERR(ir->base);
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	rc = rc_allocate_device();
++	if (!rc)
++		return -ENOMEM;
++	rc->priv = ir;
++	rc->driver_type = RC_DRIVER_IR_RAW;
++	rc->input_name = "ALi IR receiver";
++	rc->input_phys = "ali-ir/input0";
++	rc->input_id.bustype = BUS_HOST;
++	rc->dev.parent = &pdev->dev;
++	rc->driver_name = "ali-ir";
++	rc->map_name = pdata && pdata->map_name ? pdata->map_name : RC_MAP_EMPTY;
++	rc->allowed_protocols = RC_BIT_ALL;
++	rc->rx_resolution = US_TO_NS(TICK_US);
++	rc->timeout = US_TO_NS(IDLE_US);
++	ir->rc = rc;
++
++	ret = rc_register_device(rc);
++	if (ret)
++		goto err_free;
++	platform_set_drvdata(pdev, ir);
++	/* the handler must exist before the bootloader's IER (3) can raise the line */
++	ret = devm_request_irq(&pdev->dev, irq, ali_ir_irq, 0, "ali-ir", ir);
++	if (ret)
++		goto err_unreg;
++	ali_ir_hw_init(ir);
++	return 0;
++
++err_unreg:
++	rc_unregister_device(rc);
++	return ret;
++err_free:
++	rc_free_device(rc);
++	return ret;
++}
++
++static int ali_ir_remove(struct platform_device *pdev)
++{
++	struct ali_ir *ir = platform_get_drvdata(pdev);
++
++	writeb(0, ir->base + IRC_IER);
++	rc_unregister_device(ir->rc);
++	return 0;
++}
++
++static struct platform_driver ali_ir_driver = {
++	.probe	= ali_ir_probe,
++	.remove	= ali_ir_remove,
++	.driver	= { .name = "ali-ir" },
++};
++module_platform_driver(ali_ir_driver);
++MODULE_ALIAS("platform:ali-ir");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/platform_data/ali-ir.h b/include/linux/platform_data/ali-ir.h
+new file mode 100644
+index 00000000..1c31a1a1
+--- /dev/null
++++ b/include/linux/platform_data/ali-ir.h
+@@ -0,0 +1,9 @@
++#ifndef __LINUX_PLATFORM_DATA_ALI_IR_H
++#define __LINUX_PLATFORM_DATA_ALI_IR_H
++
++/* Platform data of the ali-ir receiver: which rc keymap the board's remote uses. */
++struct ali_ir_platform_data {
++	const char *map_name;		/* RC_MAP_*, NULL for an empty keymap */
++};
++
++#endif

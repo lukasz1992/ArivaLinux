@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:42:37 +0100
+Subject: [PATCH] mips: ali-c3503d: watchdog
+
+The counter at 0xB8018500 ticks at 27 MHz / 32; control 0x64 selects reset
+mode.  The probe disables a watchdog left armed by the loader, and the
+driver also provides the machine restart (watchdog reset).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile |   2 +-
+ arch/mips/ali-c3503d/wdt.c    | 194 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 195 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/wdt.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 1439b0ca..6bf5b7d6 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o
+diff --git a/arch/mips/ali-c3503d/wdt.c b/arch/mips/ali-c3503d/wdt.c
+new file mode 100644
+index 00000000..5cf92218
+--- /dev/null
++++ b/arch/mips/ali-c3503d/wdt.c
+@@ -0,0 +1,194 @@
++/*
++ * ALi C3503D watchdog (the SDK's dog_m3327e), Ferguson Ariva 54.
++ *
++ * Registers at 0xB8018500 (kseg1 view), confirmed by the A54's own
++ * firmware: its reboot arms the counter with 0xFFF30001 and control 0x67.
++ *
++ *   +0  32-bit counter start value (writing it again feeds the dog)
++ *   +4  control byte: bit 2 = enable, bits 0..1 = prescaler n, the
++ *       counter runs at the 27 MHz crystal / 2^(5+n) (844,100 ticks/s at
++ *       n = 0, measured on real hardware); bits 5..6 = mode, 0x60 resets
++ *       the chip when the counter overflows, 0x10 raises an interrupt
++ *       instead (INTC bit unknown, unused here).
++ *
++ * machine_restart() arms it with the vendor's values, so `reboot` works.
++ */
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/watchdog.h>
++
++#include <asm/reboot.h>
++
++#include "ali.h"
++
++#define ALI_WDT_BASE		0xB8018500UL
++#define ALI_WDT_CLOCK		27000000	/* the crystal, Hz */
++
++#define ALI_WDT_CTRL_ENABLE	0x04
++#define ALI_WDT_CTRL_RESET	0x60
++#define ALI_WDT_CTRL_IRQ	0x10
++
++struct ali_wdt {
++	struct watchdog_device wdd;
++	void __iomem *regs;
++	int n;					/* the prescaler bits */
++};
++
++static u32 ali_wdt_rate(int n)
++{
++	return ALI_WDT_CLOCK >> (5 + (n & 3));
++}
++
++/*
++ * The counter counts UP and resets the chip on overflow (PDK dog_m33.c:
++ * timebase = 0xFFFFFFFF - ticks), so a timeout of t seconds is loaded as
++ * 0xFFFFFFFF - t * rate.
++ */
++static u32 ali_wdt_load(struct watchdog_device *wdd, int n)
++{
++	return 0xFFFFFFFFu - wdd->timeout * ali_wdt_rate(n);
++}
++
++static inline struct ali_wdt *to_ali_wdt(struct watchdog_device *wdd)
++{
++	return container_of(wdd, struct ali_wdt, wdd);
++}
++
++static int ali_wdt_start(struct watchdog_device *wdd)
++{
++	struct ali_wdt *w = to_ali_wdt(wdd);
++
++	writel(ali_wdt_load(wdd, w->n), w->regs);
++	writel(ALI_WDT_CTRL_RESET | ALI_WDT_CTRL_ENABLE | w->n, w->regs + 4);
++	return 0;
++}
++
++static int ali_wdt_stop(struct watchdog_device *wdd)
++{
++	struct ali_wdt *w = to_ali_wdt(wdd);
++
++	writel(0, w->regs + 4);
++	writel(0, w->regs);
++	return 0;
++}
++
++static int ali_wdt_ping(struct watchdog_device *wdd)
++{
++	struct ali_wdt *w = to_ali_wdt(wdd);
++
++	writel(ali_wdt_load(wdd, w->n), w->regs);
++	return 0;
++}
++
++static int ali_wdt_set_timeout(struct watchdog_device *wdd,
++			       unsigned int timeout)
++{
++	struct ali_wdt *w = to_ali_wdt(wdd);
++	int n;
++
++	/* the smallest prescaler whose 32-bit counter still covers it */
++	for (n = 0; n < 3; n++)
++		if (timeout <= 0xFFFFFFFFu / ali_wdt_rate(n))
++			break;
++	w->n = n;
++	wdd->timeout = timeout;
++	/* a stopped dog stays stopped; start() picks up n and the new timeout */
++	return watchdog_active(wdd) ? ali_wdt_start(wdd) : 0;
++}
++
++static unsigned int ali_wdt_get_timeleft(struct watchdog_device *wdd)
++{
++	struct ali_wdt *w = to_ali_wdt(wdd);
++
++	return (0xFFFFFFFFu - readl(w->regs)) / ali_wdt_rate(w->n);
++}
++
++static const struct watchdog_info ali_wdt_info = {
++	.identity = "ALi C3503D watchdog",
++	.options = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
++};
++
++static const struct watchdog_ops ali_wdt_ops = {
++	.owner = THIS_MODULE,
++	.start = ali_wdt_start,
++	.stop = ali_wdt_stop,
++	.ping = ali_wdt_ping,
++	.set_timeout = ali_wdt_set_timeout,
++	.get_timeleft = ali_wdt_get_timeleft,
++};
++
++static struct platform_driver ali_wdt_driver;
++
++static struct ali_wdt ali_wdt = {
++	.wdd = {
++		.info = &ali_wdt_info,
++		.ops = &ali_wdt_ops,
++		.timeout = 30,
++		.min_timeout = 1,
++		/* n = 3 (the crystal / 256): 2^32-1 ticks = 40700 s */
++		.max_timeout = 40700,
++	},
++};
++
++static void ali_machine_restart_real(char *command)
++{
++	/* 0xFFF ticks of the crystal / 256 (~40 ms) to overflow, reset mode: as the
++	 * firmware's own reboot (0xFFFFF000, control 0x67) */
++	writel(0xFFFFF000u, ali_wdt.regs);
++	writel(ALI_WDT_CTRL_RESET | ALI_WDT_CTRL_ENABLE | 3, ali_wdt.regs + 4);
++	while (1)
++		;
++}
++
++static int ali_wdt_probe(struct platform_device *pdev)
++{
++	struct resource *res;
++	int ret;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	ali_wdt.regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(ali_wdt.regs))
++		return PTR_ERR(ali_wdt.regs);
++
++	/* leave the dog disabled until something opens it */
++	writel(0, ali_wdt.regs + 4);
++
++	ret = watchdog_register_device(&ali_wdt.wdd);
++	if (ret)
++		return ret;
++
++	_machine_restart = ali_machine_restart_real;
++	dev_info(&pdev->dev, "watchdog at %pR (27 MHz / 2^(5+n))\n", res);
++	return 0;
++}
++
++static int ali_wdt_remove(struct platform_device *pdev)
++{
++	watchdog_unregister_device(&ali_wdt.wdd);
++	return 0;
++}
++
++static struct platform_driver ali_wdt_driver = {
++	.probe = ali_wdt_probe,
++	.remove = ali_wdt_remove,
++	.driver = {
++		.name = "ali-wdt",
++		.owner = THIS_MODULE,
++	},
++};
++
++static int __init ali_wdt_init(void)
++{
++	return platform_driver_register(&ali_wdt_driver);
++}
++subsys_initcall(ali_wdt_init);
++
++static int __init ali_wdt_add(void)
++{
++	const struct resource wdt = DEFINE_RES_MEM(0x18018500UL, 8);
++
++	ali_add("ali-wdt", -1, &wdt, 1);
++	return 0;
++}
++arch_initcall(ali_wdt_add);

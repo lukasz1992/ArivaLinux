@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Thu, 19 Nov 2026 16:32:14 +0100
+Subject: [PATCH] mips nommu: /dev/mem mmap hands out the KSEG1 view
+ (busybox devmem)
+
+Without an MMU the address get_unmapped_area_mem() returns is used as the
+user pointer.  On nommu MIPS userland runs in kernel mode on the fixed
+mapping, where a physical address is not a usable pointer: return its
+uncached KSEG1 alias and accept it in the nommu remap_pfn_range().
+Both functions exist only without an MMU; other architectures unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/char/mem.c | 7 +++++++
+ mm/nommu.c         | 5 +++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/drivers/char/mem.c b/drivers/char/mem.c
+index 6ebe2b86..12429b92 100644
+--- a/drivers/char/mem.c
++++ b/drivers/char/mem.c
+@@ -314,4 +314,11 @@ static unsigned long get_unmapped_area_mem(struct file *file,
+ 	if (!valid_mmap_phys_addr_range(pgoff, len))
+ 		return (unsigned long) -EINVAL;
++#ifdef CONFIG_MIPS
++	/* nommu MIPS: hand out the uncached KSEG1 view (registers, devmem);
++	 * KSEG1 covers the low 512 MB only, CKSEG1ADDR() would wrap above it */
++	if (((pgoff << PAGE_SHIFT) + len) > 0x20000000UL || (pgoff << PAGE_SHIFT) > 0x20000000UL)
++		return (unsigned long) -EINVAL;
++	return CKSEG1ADDR(pgoff << PAGE_SHIFT);
++#endif
+ 	return pgoff << PAGE_SHIFT;
+ }
+diff --git a/mm/nommu.c b/mm/nommu.c
+index b2adb43e..c81359e4 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -1780,4 +1780,9 @@ int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
+ 		unsigned long pfn, unsigned long size, pgprot_t prot)
+ {
++#ifdef CONFIG_MIPS
++	/* the KSEG1 view handed out by /dev/mem (drivers/char/mem.c) */
++	if (addr == CKSEG1ADDR(pfn << PAGE_SHIFT))
++		addr = pfn << PAGE_SHIFT;
++#endif
+ 	if (addr != (pfn << PAGE_SHIFT))
+ 		return -EINVAL;

@@ -1,0 +1,3 @@
+#!/bin/sh
+# PID 1: busybox init (/etc/inittab): /etc/init.d/rcS, then a login on ttyS0.
+exec /bin/busybox init

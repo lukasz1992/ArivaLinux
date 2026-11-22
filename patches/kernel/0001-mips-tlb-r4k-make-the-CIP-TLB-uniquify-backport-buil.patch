@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Mon, 16 Nov 2026 19:05:55 +0100
+Subject: [PATCH] mips: tlb-r4k: make the CIP TLB-uniquify backport build
+ on 4.4
+
+The CIP-only backport (cip95..cip115, from 4.19) references 4.7+/5.x
+infrastructure the 4.4 tree never got: num_wired_entries(), cpu_asid_mask(),
+cpu_has_mmid, MMID_KERNEL_WIRED, write_c0_memorymapid(), flush_micro_tlb().
+Provide 4.4 equivalents (Wired register = count, constant ASID_MASK,
+flush_itlb()) and drop the MMID branches (MMID landed in 4.7).
+---
+ arch/mips/mm/tlb-r4k.c | 34 ++++++++++++++++++++++++----------
+ 1 file changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/arch/mips/mm/tlb-r4k.c b/arch/mips/mm/tlb-r4k.c
+index caea8062..ed1dcc16 100644
+--- a/arch/mips/mm/tlb-r4k.c
++++ b/arch/mips/mm/tlb-r4k.c
+@@ -474,4 +474,27 @@ static int __init set_ntlb(char *str)
+ __setup("ntlb=", set_ntlb);
+ 
++/*
++ * linux-cip backport compat (cip95..cip115 only): the CIP-only "TLB
++ * uniquify" backport (from 4.19, for cores that boot with garbage TLB
++ * entries) references 4.7+/5.x infrastructure that the 4.4 tree never
++ * received.  Provide the 4.4 equivalents here:
++ *   num_wired_entries()  -> on 4.4 the Wired register holds the count of
++ *                           wired entries (r4k_tlb_configure() just wrote
++ *                           0, and add_temporary_entry() treats the read
++ *                           value as the count);
++ *   cpu_asid_mask()      -> the constant ASID_MASK of mmu_context.h
++ *                           (8-bit ASID on 4KEc-class cores);
++ *   flush_micro_tlb()    -> flush_itlb(), the same-file microTLB flush.
++ * The cpu_has_mmid (CP0.MemoryMapID / ginvt_mmid) branches are dropped:
++ * MMID support landed in 4.7 and no 4.4-era core uses it.
++ */
++static inline int num_wired_entries(void)
++{
++	return read_c0_wired();
++}
++
++#define cpu_asid_mask(cpu)	ASID_MASK
++#define flush_micro_tlb()	flush_itlb()
++
+ /* Initialise all TLB entries with unique values */
+ static void r4k_tlb_uniquify(void)
+@@ -488,16 +511,7 @@ static void r4k_tlb_uniquify(void)
+ 		int idx;
+ 
+-		/* Skip wired MMID to make ginvt_mmid work */
+-		if (cpu_has_mmid)
+-			asid = MMID_KERNEL_WIRED + 1;
+-
+ 		/* Check for match before using UNIQUE_ENTRYHI */
+ 		do {
+-			if (cpu_has_mmid) {
+-				write_c0_memorymapid(asid);
+-				write_c0_entryhi(UNIQUE_ENTRYHI(entry));
+-			} else {
+-				write_c0_entryhi(UNIQUE_ENTRYHI(entry) | asid);
+-			}
++			write_c0_entryhi(UNIQUE_ENTRYHI(entry) | asid);
+ 			mtc0_tlbw_hazard();
+ 			tlb_probe();

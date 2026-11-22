@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:53:16 +0100
+Subject: [PATCH] mips: ali-c3503d: built-in initramfs from the SDK
+ rootfs tree
+
+The initramfs list carries only the console node (needed before devtmpfs);
+the tree itself is the rootfs/ link, which the SDK points at its out/rootfs.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/initramfs.list | 6 ++++++
+ 1 file changed, 6 insertions(+)
+ create mode 100644 arch/mips/ali-c3503d/initramfs.list
+
+diff --git a/arch/mips/ali-c3503d/initramfs.list b/arch/mips/ali-c3503d/initramfs.list
+new file mode 100644
+index 00000000..193c4b40
+--- /dev/null
++++ b/arch/mips/ali-c3503d/initramfs.list
+@@ -0,0 +1,6 @@
++# Built-in initramfs for the ALi C3503D (gen_init_cpio list; paths relative to the kernel build root).
++# The tree itself comes from arch/mips/ali-c3503d/rootfs/: a link to the SDK's out/rootfs (assembled
++# by scripts/20-userspace.sh from rootfs/skeleton and the built programs; not in the kernel tree).
++# Only what a plain directory cannot carry lives here: the console node, needed before devtmpfs.
++dir /dev 0755 0 0
++nod /dev/console 0600 0 0 c 5 1

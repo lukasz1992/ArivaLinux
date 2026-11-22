@@ -1,0 +1,5 @@
+# busybox init: start-up scripts, then a login prompt on the UART console
+::sysinit:/etc/init.d/rcS
+ttyS0::respawn:/bin/login
+::ctrlaltdel:/bin/reboot
+::shutdown:/bin/umount -a -r

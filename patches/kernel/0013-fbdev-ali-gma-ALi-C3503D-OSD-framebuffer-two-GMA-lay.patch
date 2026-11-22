@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:41:36 +0100
+Subject: [PATCH] fbdev: ali-gma: ALi C3503D OSD framebuffer (two GMA
+ layers)
+
+A 1280x720 ARGB1555 bitmap per layer, shown through a 720x576 window.
+Layer 0 is fb0 and on at probe, layer 1 is fb1 and off until unblanked
+(echo 0 > /sys/class/graphics/fb1/blank); a per-layer "alpha" attribute
+sets the constant layer alpha.  The nommu ioremap and asm/fb.h hooks give
+the driver the uncached KSEG1 view of the bitmap.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile  |   2 +-
+ arch/mips/ali-c3503d/dev-gma.c |  21 +++
+ arch/mips/include/asm/fb.h     |   8 ++
+ arch/mips/mm/ioremap-nommu.c   |  27 ++++
+ drivers/video/fbdev/Kconfig    |  11 ++
+ drivers/video/fbdev/Makefile   |   1 +
+ drivers/video/fbdev/ali-gma.c  | 255 +++++++++++++++++++++++++++++++++
+ 7 files changed, 324 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/dev-gma.c
+ create mode 100644 drivers/video/fbdev/ali-gma.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 48475dba..fdf3a0fd 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o dev-flash.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o
+diff --git a/arch/mips/ali-c3503d/dev-gma.c b/arch/mips/ali-c3503d/dev-gma.c
+new file mode 100644
+index 00000000..d83dc9bb
+--- /dev/null
++++ b/arch/mips/ali-c3503d/dev-gma.c
+@@ -0,0 +1,21 @@
++/*
++ * ALi C3503D OSD layers (GMA) for drivers/video/fbdev/ali-gma.c
++ *
++ * Layer 0 (register block 0x18006300) becomes fb0 and is on after probe;
++ * layer 1 (0x18006380) becomes fb1 and stays off until it is unblanked.
++ */
++#include <linux/init.h>
++#include <linux/platform_device.h>
++
++#include "ali.h"
++
++static int __init ali_gma_init(void)
++{
++	const struct resource gma0 = DEFINE_RES_MEM(0x18006300UL, 0x10);	/* layer F */
++	const struct resource gma1 = DEFINE_RES_MEM(0x18006380UL, 0x10);	/* layer S */
++
++	ali_add("ali-gma", 0, &gma0, 1);
++	ali_add("ali-gma", 1, &gma1, 1);
++	return 0;
++}
++arch_initcall(ali_gma_init);
+diff --git a/arch/mips/include/asm/fb.h b/arch/mips/include/asm/fb.h
+index bd3f68c9..0addf01f 100644
+--- a/arch/mips/include/asm/fb.h
++++ b/arch/mips/include/asm/fb.h
+@@ -12,4 +12,12 @@ static inline void fb_pgprotect(struct file *file, struct vm_area_struct *vma,
+ }
+ 
++#ifndef CONFIG_MMU
++/* nommu: mmap of a framebuffer hands out its uncached KSEG1 view (arch/mips/mm/ioremap-nommu.c) */
++#define HAVE_ARCH_FB_UNMAPPED_AREA
++extern unsigned long get_fb_unmapped_area(struct file *filp, unsigned long orig_addr,
++					  unsigned long len, unsigned long pgoff,
++					  unsigned long flags);
++#endif
++
+ static inline int fb_is_primary_device(struct fb_info *info)
+ {
+diff --git a/arch/mips/mm/ioremap-nommu.c b/arch/mips/mm/ioremap-nommu.c
+index 8f483015..261cfbcf 100644
+--- a/arch/mips/mm/ioremap-nommu.c
++++ b/arch/mips/mm/ioremap-nommu.c
+@@ -13,4 +13,6 @@
+  */
+ #include <linux/export.h>
++#include <linux/fb.h>
++#include <linux/fs.h>
+ #include <linux/mm.h>
+ #include <linux/init.h>
+@@ -54,2 +56,27 @@ void __iounmap(const volatile void __iomem *addr)
+ }
+ EXPORT_SYMBOL(__iounmap);
++
++#ifdef CONFIG_FB
++/*
++ * mmap() of /dev/fbN on nommu: the mapping is the framebuffer's own memory
++ * through the fixed uncached KSEG1 window (the same view /dev/mem hands out,
++ * accepted by remap_pfn_range() in mm/nommu.c).  Needs smem_start in the low
++ * 512 MB, as for ioremap above.
++ */
++unsigned long get_fb_unmapped_area(struct file *filp, unsigned long orig_addr,
++				   unsigned long len, unsigned long pgoff,
++				   unsigned long flags)
++{
++	struct fb_info *info = filp->private_data;
++	unsigned long start, size, off = pgoff << PAGE_SHIFT;
++
++	if (!info)
++		return (unsigned long) -ENODEV;
++	start = info->fix.smem_start & PAGE_MASK;
++	size = PAGE_ALIGN(info->fix.smem_len + (info->fix.smem_start & ~PAGE_MASK));
++	if (off > size || len > size - off || !IS_LOW512(start + size - 1))
++		return (unsigned long) -EINVAL;
++	return CKSEG1ADDR(start + off);
++}
++EXPORT_SYMBOL(get_fb_unmapped_area);
++#endif
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+index 091cbafa..02396b7f 100644
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -2421,4 +2421,15 @@ config FB_HYPERV
+ 	  This framebuffer driver supports Microsoft Hyper-V Synthetic Video.
+ 
++config FB_ALI_GMA
++	tristate "ALi C3503D GMA framebuffer"
++	depends on FB && MIPS_ALI_C3503D
++	select FB_CFB_FILLRECT
++	select FB_CFB_COPYAREA
++	select FB_CFB_IMAGEBLIT
++	help
++	  Framebuffer on GMA layer 0 of the ALi C3503D (1280x720 ARGB1555
++	  scaled into the output window).  Does not program the display
++	  engine's timing.
++
+ config FB_SIMPLE
+ 	bool "Simple framebuffer support"
+diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
+index 65fb1507..ff4b0506 100644
+--- a/drivers/video/fbdev/Makefile
++++ b/drivers/video/fbdev/Makefile
+@@ -148,4 +148,5 @@ obj-$(CONFIG_FB_DA8XX)		  += da8xx-fb.o
+ obj-$(CONFIG_FB_MXS)		  += mxsfb.o
+ obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
++obj-$(CONFIG_FB_ALI_GMA)       += ali-gma.o
+ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
+ 
+diff --git a/drivers/video/fbdev/ali-gma.c b/drivers/video/fbdev/ali-gma.c
+new file mode 100644
+index 00000000..8143ab07
+--- /dev/null
++++ b/drivers/video/fbdev/ali-gma.c
+@@ -0,0 +1,255 @@
++/*
++ * ALi C3503D GMA layers as framebuffers (Ferguson Ariva 54): fb0 = layer 0 (F, 0xB8006300),
++ * fb1 = layer 1 (S, 0xB8006380; same register layout, 0x80 further on).
++ *
++ * Each OSD layer is a 10-word "head" in RAM (pointed to by the layer's head register,
++ * 0xB8006304 / 0xB8006384) that describes a bitmap, the window it appears in and the
++ * scaler steps.  This driver builds the same head the A54 firmware does
++ * (values from its trace): a 1280x720 ARGB1555 surface scaled into the
++ * 720x576 output window.  The display engine itself (VPO/TVE/HDMI
++ * timing) is not set up here.
++ *
++ *   layer regs (base 0xB8006300): +0 control (bit 0 on, bit 18 set by
++ *   the vendor driver), +4 head address (physical), +8 global alpha K.
++ *   head: DW0 flags/mode 0xAA200B55 (last block, scale on, ARGB1555),
++ *   DW2/DW3 window (x1 << 16 | x0, y1 << 16 | y0), DW4 source (h << 16 | w),
++ *   DW5 pitch << 16 | alpha, DW7 bitmap address, DW9 scale steps
++ *   (v << 16 | h, 4.12 fixed point).
++ *
++ * The bitmap is accessed uncached (kseg1): the engine reads RAM directly.
++ *
++ * Layer 0 is switched on at probe (as the vendor firmware does).  Layer 1 is left OFF (the firmware keeps it off:
++ * S_CTRL = 0x40000): `echo 0 > /sys/class/graphics/fb1/blank` turns it on, `echo 4 > .../blank` off.  Its bitmap
++ * starts out all zero, i.e. transparent (ARGB1555 alpha bit clear).  Each layer has a sysfs attribute `alpha` (0..255)
++ * on its platform device: the global alpha K (bit 16 enables it, the low byte is the value; 0xFF = opaque, off).
++ * Which layer is on top and how the layers blend with the video plane is set in VPOST_MIX_CTRL (0xB80061EC), not
++ * touched here.
++ */
++#include <linux/device.h>
++#include <linux/fb.h>
++#include <linux/io.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <asm/addrspace.h>
++
++#define GMA_WIDTH	1280
++#define GMA_HEIGHT	720
++#define GMA_PITCH	(GMA_WIDTH * 2)
++#define GMA_SIZE	(GMA_PITCH * GMA_HEIGHT)
++
++#define GMA_CTRL	0x00
++#define GMA_HEAD	0x04
++#define GMA_K		0x08
++#define GMA_CTRL_ON	0x00040001
++#define GMA_CTRL_OFF	0x00040000
++
++static unsigned int out_width = 720, out_height = 576;	/* the output window */
++module_param(out_width, uint, 0444);
++module_param(out_height, uint, 0444);
++
++struct ali_gma {
++	struct fb_info *info;
++	void __iomem *regs;
++	void *bitmap, *head;
++	u32 pseudo_palette[16];
++	int layer;
++	unsigned int alpha;		/* 0..255, 255 = opaque */
++};
++
++static int ali_gma_setcolreg(unsigned int regno, unsigned int red, unsigned int green,
++			     unsigned int blue, unsigned int transp, struct fb_info *info)
++{
++	if (regno >= 16)
++		return 1;
++	/* ARGB1555, alpha bit set = opaque */
++	((u32 *)info->pseudo_palette)[regno] =
++		0x8000 | ((red >> 11) << 10) | ((green >> 11) << 5) | (blue >> 11);
++	return 0;
++}
++
++static int ali_gma_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
++{
++	if (var->xres != GMA_WIDTH || var->yres != GMA_HEIGHT || var->bits_per_pixel != 16)
++		return -EINVAL;
++	/* one fixed mode: whatever else the caller asked for is replaced by it */
++	var->xres_virtual = GMA_WIDTH;
++	var->yres_virtual = GMA_HEIGHT;
++	var->xoffset = var->yoffset = 0;
++	var->red = info->var.red;
++	var->green = info->var.green;
++	var->blue = info->var.blue;
++	var->transp = info->var.transp;
++	return 0;
++}
++
++static int ali_gma_blank(int blank, struct fb_info *info)
++{
++	struct ali_gma *g = info->par;
++
++	writel(blank == FB_BLANK_UNBLANK ? GMA_CTRL_ON : GMA_CTRL_OFF, g->regs + GMA_CTRL);
++	return 0;
++}
++
++static void ali_gma_set_alpha(struct ali_gma *g, unsigned int alpha)
++{
++	g->alpha = alpha;
++	writel(alpha == 255 ? 0xFF : (0x10000 | alpha), g->regs + GMA_K);
++}
++
++static ssize_t alpha_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct ali_gma *g = dev_get_drvdata(dev);
++
++	return sprintf(buf, "%u\n", g->alpha);
++}
++
++static ssize_t alpha_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct ali_gma *g = dev_get_drvdata(dev);
++	unsigned int v;
++
++	if (kstrtouint(buf, 0, &v) || v > 255)
++		return -EINVAL;
++	ali_gma_set_alpha(g, v);
++	return count;
++}
++static DEVICE_ATTR_RW(alpha);
++
++static struct fb_ops ali_gma_ops = {
++	.owner		= THIS_MODULE,
++	.fb_blank	= ali_gma_blank,
++	.fb_check_var	= ali_gma_check_var,
++	.fb_setcolreg	= ali_gma_setcolreg,
++	.fb_fillrect	= cfb_fillrect,
++	.fb_copyarea	= cfb_copyarea,
++	.fb_imageblit	= cfb_imageblit,
++};
++
++static void ali_gma_build_head(struct ali_gma *g, phys_addr_t bitmap)
++{
++	u32 *h = g->head;
++
++	h[0] = 0xAA200B55;
++	h[1] = 0;
++	h[2] = ((out_width - 1) << 16) | 0;
++	h[3] = ((out_height - 1) << 16) | 0;
++	h[4] = (GMA_HEIGHT << 16) | GMA_WIDTH;
++	h[5] = (GMA_PITCH << 16) | 0x0F;
++	h[6] = 0;
++	h[7] = bitmap;
++	h[8] = 0;
++	h[9] = (((GMA_HEIGHT << 12) / out_height) << 16) | ((GMA_WIDTH << 12) / out_width);
++}
++
++static int ali_gma_probe(struct platform_device *pdev)
++{
++	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	struct fb_info *info;
++	struct ali_gma *g;
++	phys_addr_t bitmap, head;
++	void __iomem *regs;
++
++	regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(regs))
++		return PTR_ERR(regs);
++
++	info = framebuffer_alloc(sizeof(*g), &pdev->dev);
++	if (!info)
++		return -ENOMEM;
++	g = info->par;
++	g->info = info;
++	g->regs = regs;
++	g->layer = pdev->id > 0 ? pdev->id : 0;
++	g->alpha = 255;
++
++	if (!out_width || !out_height || out_width > 4096 || out_height > 4096) {
++		dev_err(&pdev->dev, "bad out_width/out_height\n");
++		framebuffer_release(info);
++		return -EINVAL;
++	}
++	g->bitmap = alloc_pages_exact(GMA_SIZE, GFP_KERNEL | __GFP_ZERO);
++	g->head = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++	if (!g->bitmap || !g->head) {
++		if (g->bitmap)
++			free_pages_exact(g->bitmap, GMA_SIZE);
++		if (g->head)
++			free_page((unsigned long)g->head);
++		framebuffer_release(info);
++		return -ENOMEM;
++	}
++	/*
++	 * The zeroing above went through the cached KSEG0 view and is still dirty in the
++	 * write-back D-cache; everything below goes through uncached KSEG1, so push the
++	 * zeros to RAM first or a later eviction would overwrite what is written there.
++	 */
++	dma_cache_wback_inv((unsigned long)g->bitmap, GMA_SIZE);
++	dma_cache_wback_inv((unsigned long)g->head, PAGE_SIZE);
++	bitmap = virt_to_phys(g->bitmap);
++	head = virt_to_phys(g->head);
++	g->bitmap = (void *)KSEG1ADDR(bitmap);		/* uncached views */
++	g->head = (void *)KSEG1ADDR(head);
++	ali_gma_build_head(g, bitmap);
++
++	info->fbops = &ali_gma_ops;
++	info->flags = FBINFO_DEFAULT;
++	info->screen_base = (char __iomem *)g->bitmap;
++	info->screen_size = GMA_SIZE;
++	info->pseudo_palette = g->pseudo_palette;
++	snprintf(info->fix.id, sizeof(info->fix.id), "ali-gma%d", g->layer);
++	info->fix.type = FB_TYPE_PACKED_PIXELS;
++	info->fix.visual = FB_VISUAL_TRUECOLOR;
++	info->fix.smem_start = bitmap;
++	info->fix.smem_len = GMA_SIZE;
++	info->fix.line_length = GMA_PITCH;
++	info->var.xres = info->var.xres_virtual = GMA_WIDTH;
++	info->var.yres = info->var.yres_virtual = GMA_HEIGHT;
++	info->var.bits_per_pixel = 16;
++	info->var.red = (struct fb_bitfield){ 10, 5, 0 };
++	info->var.green = (struct fb_bitfield){ 5, 5, 0 };
++	info->var.blue = (struct fb_bitfield){ 0, 5, 0 };
++	info->var.transp = (struct fb_bitfield){ 15, 1, 0 };
++	info->var.activate = FB_ACTIVATE_NOW;
++
++	platform_set_drvdata(pdev, g);
++	if (register_framebuffer(info)) {
++		free_pages_exact((void *)KSEG0ADDR(bitmap), GMA_SIZE);
++		free_page(KSEG0ADDR(head));
++		framebuffer_release(info);
++		return -ENODEV;
++	}
++	writel(0xFF, regs + GMA_K);
++	writel(head, regs + GMA_HEAD);
++	/* layer 0 shows at once (as the vendor firmware does); layer 1 stays off until unblanked */
++	writel(g->layer ? GMA_CTRL_OFF : GMA_CTRL_ON, regs + GMA_CTRL);
++	if (device_create_file(&pdev->dev, &dev_attr_alpha))
++		dev_warn(&pdev->dev, "cannot create the alpha attribute\n");
++	dev_info(&pdev->dev, "layer %d: %dx%d ARGB1555 -> %ux%u window, bitmap %pa, head %pa, %s\n",
++		 g->layer, GMA_WIDTH, GMA_HEIGHT, out_width, out_height, &bitmap, &head,
++		 g->layer ? "off (unblank fb to show)" : "on");
++	return 0;
++}
++
++static int ali_gma_remove(struct platform_device *pdev)
++{
++	struct ali_gma *g = platform_get_drvdata(pdev);
++
++	device_remove_file(&pdev->dev, &dev_attr_alpha);
++	writel(GMA_CTRL_OFF, g->regs + GMA_CTRL);
++	unregister_framebuffer(g->info);
++	free_pages_exact((void *)KSEG0ADDR(CPHYSADDR(g->bitmap)), GMA_SIZE);
++	free_page(KSEG0ADDR(CPHYSADDR(g->head)));
++	framebuffer_release(g->info);
++	return 0;
++}
++
++static struct platform_driver ali_gma_driver = {
++	.probe	= ali_gma_probe,
++	.remove	= ali_gma_remove,
++	.driver	= { .name = "ali-gma" },
++};
++module_platform_driver(ali_gma_driver);
++
++MODULE_DESCRIPTION("ALi C3503D GMA layers 0 and 1 framebuffers");
++MODULE_ALIAS("platform:ali-gma");
++MODULE_LICENSE("GPL");

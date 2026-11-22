@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:46:02 +0100
+Subject: [PATCH] i2c: ali-scb: ALi SCB I2C master (two controllers)
+
+Serial-controller-bus masters at 0x18018200 and 0x18018700 as i2c adapters.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile  |   2 +-
+ arch/mips/ali-c3503d/i2c-scb.c | 263 +++++++++++++++++++++++++++++++++
+ 2 files changed, 264 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/i2c-scb.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 6cc15ef2..b8cb53d9 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc.o i2c-scb.o
+diff --git a/arch/mips/ali-c3503d/i2c-scb.c b/arch/mips/ali-c3503d/i2c-scb.c
+new file mode 100644
+index 00000000..dd834010
+--- /dev/null
++++ b/arch/mips/ali-c3503d/i2c-scb.c
+@@ -0,0 +1,263 @@
++/*
++ * ALi C3503D hardware I2C master ("SCB"), Ferguson Ariva 54.
++ *
++ * The SoC's SCB blocks (the SDK's i2c driver; the simulator models them
++ * as i2c_scb.py): SCB0 at 0xB8018200 (INTC bit 18 = IRQ 26), SCB1 at
++ * 0xB8018700 (INTC bit 25 = IRQ 33).  The tuner and board EEPROMs hang
++ * on them.  Registers (kseg1 view):
++ *
++ *   +0    control: a write with bit 0 set starts a transfer -- 0x41
++ *         write the FIFO's bytes, 0x45 read, 0x49 write the
++ *         sub-address(es) then read (the firmware always sends bit 6)
++ *   +1    status (cleared by writing 0): bits 7..5 transfer in
++ *         progress, bit 1 FIFO full
++ *   +3    flags, cleared by writing the bits back: bit 0 complete,
++ *         bits 3..1 error (0x0E = no ACK)
++ *   +4    the slave address byte (bit 0 = read)
++ *   +5    sub-address byte (+0x25.. with +0x24 = sub_extra: up to
++ *         1 + 3 sub-address bytes)
++ *   +6..+B clock dividers (6 MHz / SCL)
++ *   +0xC  bit 7 FIFO enable | transfer length (bits 4..0; a write with
++ *         bit 7 clear empties the FIFOs); read-back: 0x80 | received
++ *   +0x10 the data FIFO: writes queue, reads pop
++ *   +0x14 bits 2..0 read 0 = bus idle
++ *
++ * The transfer is started with the control byte and completes when
++ * flags bit 0 shows (polled here with the vendor's 99 ms timeout; the
++ * INTC interrupt is not wired yet).  The clock divider targets 100 kHz
++ * from the SCB's 6 MHz reference.
++ */
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/i2c.h>
++#include <linux/delay.h>
++
++#include "ali.h"
++
++#define ALI_SCB_SIZE		0x28
++#define ALI_SCB_FIFO_LEN	32		/* length bits 4..0 | hi << 5 */
++
++/* the firmware's start bytes are 0x41 (write), 0x45 (read), 0x49 (sub-address, then read) */
++#define ALI_SCB_CTRL_ENABLE	0x40
++#define ALI_SCB_CTRL_START	0x01
++#define ALI_SCB_CTRL_READ	0x04
++#define ALI_SCB_CTRL_COMBINED	0x08
++#define ALI_SCB_FLAG_DONE	0x01
++#define ALI_SCB_FLAG_ERROR	0x0E
++
++struct ali_scb {
++	void __iomem *regs;
++	struct i2c_adapter adap;
++	int irq;				/* not used yet: polled */
++	bool hi_set;				/* +0x23 holds length bits: clear it for short transfers */
++};
++
++/* the firmware's driver waits for status bits 7..5 (transfer in progress) to clear */
++static int ali_scb_wait_idle(struct ali_scb *scb)
++{
++	int tries;
++
++	for (tries = 0; tries < 700; tries++) {
++		if (!(readb(scb->regs + 1) & 0xE0))
++			return 0;
++		if (tries < 50)
++			udelay(20);
++		else
++			usleep_range(100, 200);
++	}
++	return -ETIMEDOUT;
++}
++
++static int ali_scb_wait_done(struct ali_scb *scb)
++{
++	int tries;
++
++	/* the transfer completes in flags bit 0; the vendor's budget is 99 ms */
++	for (tries = 0; tries < 700; tries++) {
++		u8 flags = readb(scb->regs + 3);
++
++		if (flags & ALI_SCB_FLAG_DONE)
++			return 0;
++		if (flags & ALI_SCB_FLAG_ERROR)
++			return -ENXIO;		/* no ACK */
++		if (tries < 50)
++			udelay(20);
++		else
++			usleep_range(100, 200);
++	}
++	return -ETIMEDOUT;
++}
++
++/* empty the FIFOs and clear status and flags: before a message and after a failed one */
++static void ali_scb_clean(struct ali_scb *scb)
++{
++	writeb(0, scb->regs + 0x0C);		/* bit 7 clear: empties the FIFOs */
++	writeb(0, scb->regs + 1);
++	writeb(0x0F, scb->regs + 3);
++}
++
++/* transfer length: bits 4..0 at +0xC, the rest at +0x23 (written when used, and cleared after) */
++static void ali_scb_length(struct ali_scb *scb, int len)
++{
++	writeb(0x80 | (len & 0x1F), scb->regs + 0x0C);
++	if ((len >> 5) || scb->hi_set) {
++		writeb((len >> 5) & 0x7, scb->regs + 0x23);
++		scb->hi_set = (len >> 5) != 0;
++	}
++}
++
++static int ali_scb_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
++			int num)
++{
++	struct ali_scb *scb = i2c_get_adapdata(adap);
++	int i, ret = 0;
++
++	for (i = 0; i < num; i++) {
++		struct i2c_msg *msg = &msgs[i];
++		u8 control;
++		int len = msg->len;
++
++		if (len > ALI_SCB_FIFO_LEN * 2)
++			return -EOPNOTSUPP;
++
++		ret = ali_scb_wait_idle(scb);
++		if (ret)
++			goto fail;
++		ali_scb_clean(scb);
++		writeb((msg->addr << 1) | (msg->flags & I2C_M_RD ? 1 : 0),
++		       scb->regs + 4);
++
++		if (msg->flags & I2C_M_RD) {
++			/* a plain read */
++			if (len < 1)
++				return -EOPNOTSUPP;
++			ali_scb_length(scb, len);
++			control = ALI_SCB_CTRL_ENABLE | ALI_SCB_CTRL_START |
++				  ALI_SCB_CTRL_READ;
++		} else if (len >= 1 && len <= 4 && i + 1 < num &&
++			   (msgs[i + 1].flags & I2C_M_RD) &&
++			   msgs[i + 1].len >= 1 &&
++			   msgs[i + 1].len <= ALI_SCB_FIFO_LEN * 2) {
++			/* write-then-read with a sub-address (the common
++			 * register case): combined transfer 0x49 */
++			struct i2c_msg *rd = &msgs[i + 1];
++			int j;
++
++			writeb(len - 1, scb->regs + 0x24);
++			for (j = 0; j < len; j++)
++				writeb(msg->buf[j], scb->regs + 0x25 + j);
++			ali_scb_length(scb, rd->len);
++			writeb((rd->addr << 1) | 1, scb->regs + 4);
++			control = ALI_SCB_CTRL_ENABLE | ALI_SCB_CTRL_START |
++				  ALI_SCB_CTRL_COMBINED;
++			msg = rd;		/* the data read comes back into the read message */
++			len = rd->len;
++			i++;
++		} else {
++			/* a plain write */
++			int j;
++
++			ali_scb_length(scb, len);
++			for (j = 0; j < len; j++)
++				writeb(msg->buf[j], scb->regs + 0x10);
++			control = ALI_SCB_CTRL_ENABLE | ALI_SCB_CTRL_START;
++		}
++
++		writeb(control, scb->regs);		/* go */
++		ret = ali_scb_wait_done(scb);
++		if (ret)
++			goto fail;
++
++		if (msg->flags & I2C_M_RD) {
++			int n;
++
++			for (n = 0; n < len; n++)
++				msg->buf[n] = readb(scb->regs + 0x10);
++		}
++	}
++	return num;
++
++fail:
++	ali_scb_clean(scb);
++	return ret < 0 ? ret : -EIO;
++}
++
++static u32 ali_scb_func(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
++}
++
++static const struct i2c_algorithm ali_scb_algo = {
++	.master_xfer = ali_scb_xfer,
++	.functionality = ali_scb_func,
++};
++
++static int ali_scb_probe(struct platform_device *pdev)
++{
++	struct ali_scb *scb;
++	struct resource *res;
++	int ret;
++
++	scb = devm_kzalloc(&pdev->dev, sizeof(*scb), GFP_KERNEL);
++	if (!scb)
++		return -ENOMEM;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	scb->regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(scb->regs))
++		return PTR_ERR(scb->regs);
++
++	/* SCB clock: 6 MHz / divider = 100 kHz; enable the block */
++	writeb(60, scb->regs + 6);
++	writeb(ALI_SCB_CTRL_ENABLE, scb->regs);
++
++	scb->adap.owner = THIS_MODULE;
++	scb->adap.algo = &ali_scb_algo;
++	scb->adap.dev.parent = &pdev->dev;
++	strlcpy(scb->adap.name, "ali-scb", sizeof(scb->adap.name));
++	i2c_set_adapdata(&scb->adap, scb);
++
++	platform_set_drvdata(pdev, scb);
++
++	ret = i2c_add_adapter(&scb->adap);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev, "SCB i2c at %pR\n", res);
++	return 0;
++}
++
++static int ali_scb_remove(struct platform_device *pdev)
++{
++	struct ali_scb *scb = platform_get_drvdata(pdev);
++
++	i2c_del_adapter(&scb->adap);
++	return 0;
++}
++
++static struct platform_driver ali_scb_driver = {
++	.probe = ali_scb_probe,
++	.remove = ali_scb_remove,
++	.driver = {
++		.name = "ali-scb",
++		.owner = THIS_MODULE,
++	},
++};
++
++static int __init ali_scb_init(void)
++{
++	return platform_driver_register(&ali_scb_driver);
++}
++subsys_initcall(ali_scb_init);
++
++static int __init ali_scb_add(void)
++{
++	const struct resource scb0 = DEFINE_RES_MEM(0x18018200UL, 0x28);
++	const struct resource scb1 = DEFINE_RES_MEM(0x18018700UL, 0x28);
++
++	ali_add("ali-scb", 0, &scb0, 1);
++	ali_add("ali-scb", 1, &scb1, 1);
++	return 0;
++}
++arch_initcall(ali_scb_add);

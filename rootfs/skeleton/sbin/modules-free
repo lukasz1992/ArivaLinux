@@ -1,0 +1,11 @@
+#!/bin/sh
+# FREE_LOADED=1 in /etc/modules.conf: delete the .ko files of the modules that are loaded now.  The initramfs lives in RAM,
+# so that gives the memory back; rmmod still works, loading the same module again does not.
+FREE_LOADED=0
+[ -f /etc/modules.conf ] && . /etc/modules.conf
+[ "$FREE_LOADED" = 1 ] || exit 0
+rel=$(uname -r)
+for m in $(cut -d' ' -f1 /proc/modules); do
+	for f in $(find /lib/modules/$rel -name "$m.ko" -o -name "$(echo "$m" | tr _ -).ko" 2>/dev/null); do rm -f "$f"; done
+done
+exit 0

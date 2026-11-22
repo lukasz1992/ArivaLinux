@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Tue, 17 Nov 2026 17:09:24 +0100
+Subject: [PATCH] mips: nommu headers (pgtable_no, uaccess_no, generic mm
+ hooks): P2
+
+New headers (m68k/microblaze patterns):
+
+- pgtable_no.h: trivial page tables; 4level-fixup folds pud_* onto
+  pgd_*, pmd_t exists only to satisfy generic declarations; swapper_pg_dir,
+  VMALLOC_{START,END}, ZERO_PAGE=BUG, update_mmu_cache no-op.
+- uaccess_no.h: includes asm-generic/uaccess.h (userland runs in kernel mode,
+  'user' pointers are kernel pointers: access_ok() is always true, copies
+  are memcpy).  exception_table_entry::nextinsn is renamed 'fixup' to match
+  the generic struct (arch/mips/mm/extable.c, traps.c).
+
+Gated behind CONFIG_MMU (nommu branches added):
+
+- asm/pgtable.h -> pgtable_no.h
+- asm/uaccess.h -> uaccess_no.h
+- asm/mmu.h -> asm-generic/mmu.h (end_brk for sys_brk in mm/nommu.c)
+- asm/mmu_context.h -> asm-generic/mmu_context.h (no ASID bookkeeping)
+- asm/tlbflush.h -> asm-generic/tlbflush.h
+- asm/pgalloc.h: body compiled only under MMU (asm-generic/tlb.h keeps
+  compiling, nothing uses mmu_gather under nommu: memory.o is MMU-only)
+
+Also:
+
+- uapi/asm/mman.h: define MAP_UNINITIALIZED (mm/nommu.c needs it; MIPS
+  has its own uapi mman.h, not the asm-generic one).
+- kernel/asm-offsets.c: page-table DEFINEs (PGD/PMD/PTRS_PER_*, orders)
+  moved under CONFIG_MMU; MM_PGD stays (mm_struct::pgd is unconditional).
+
+Status (ali_c3503d_defconfig, MMU=n): kernel/ fs/ mm/ net/ lib/ crypto/
+block/ ipc/ security/ all build warning-free.  Regression (malta, MMU=y):
+fork.o memory.o exec.o read_write.o signal.o traps.o mm/init.o fault.o
+build clean.  Tree still does not link under nommu -- P3 gates the
+arch/mips TLB files out of the build (docs/nommu_mipsel_implementation.md).
+---
+ arch/mips/include/asm/mmu.h         | 12 +++++
+ arch/mips/include/asm/mmu_context.h |  9 ++++
+ arch/mips/include/asm/pgalloc.h     |  4 ++
+ arch/mips/include/asm/pgtable.h     |  6 +++
+ arch/mips/include/asm/pgtable_no.h  | 82 +++++++++++++++++++++++++++++
+ arch/mips/include/asm/tlbflush.h    |  6 +++
+ arch/mips/include/asm/uaccess.h     |  8 ++-
+ arch/mips/include/asm/uaccess_no.h  | 19 +++++++
+ arch/mips/include/uapi/asm/mman.h   | 10 ++++
+ arch/mips/kernel/asm-offsets.c      |  2 +
+ arch/mips/kernel/traps.c            |  2 +-
+ arch/mips/mm/extable.c              | 31 ++++++++++-
+ 12 files changed, 188 insertions(+), 3 deletions(-)
+ create mode 100644 arch/mips/include/asm/pgtable_no.h
+ create mode 100644 arch/mips/include/asm/uaccess_no.h
+
+diff --git a/arch/mips/include/asm/mmu.h b/arch/mips/include/asm/mmu.h
+index 1afa1f98..e04d5711 100644
+--- a/arch/mips/include/asm/mmu.h
++++ b/arch/mips/include/asm/mmu.h
+@@ -2,4 +2,6 @@
+ #define __ASM_MMU_H
+ 
++#ifdef CONFIG_MMU
++
+ #include <linux/atomic.h>
+ 
+@@ -10,3 +12,13 @@ typedef struct {
+ } mm_context_t;
+ 
++#else /* CONFIG_MMU */
++
++/*
++ * No-MMU (fixed mapping) core: no ASID to save and no vdso; keep
++ * end_brk for sys_brk() in mm/nommu.c (asm-generic/mmu.h).
++ */
++#include <asm-generic/mmu.h>
++
++#endif /* CONFIG_MMU */
++
+ #endif /* __ASM_MMU_H */
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 45914b59..a76ef41b 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -21,4 +21,11 @@
+ #include <asm-generic/mm_hooks.h>
+ 
++#ifndef CONFIG_MMU
++/*
++ * No MMU context to switch: the fixed mapping is global to the core.
++ */
++#include <asm-generic/mmu_context.h>
++#else /* CONFIG_MMU */
++
+ #define htw_set_pwbase(pgd)						\
+ do {									\
+@@ -222,3 +229,5 @@ drop_mmu_context(struct mm_struct *mm, unsigned cpu)
+ }
+ 
++#endif /* CONFIG_MMU */
++
+ #endif /* _ASM_MMU_CONTEXT_H */
+diff --git a/arch/mips/include/asm/pgalloc.h b/arch/mips/include/asm/pgalloc.h
+index b336037e..6ad32c03 100644
+--- a/arch/mips/include/asm/pgalloc.h
++++ b/arch/mips/include/asm/pgalloc.h
+@@ -14,4 +14,6 @@
+ #include <linux/sched.h>
+ 
++#ifdef CONFIG_MMU
++
+ static inline void pmd_populate_kernel(struct mm_struct *mm, pmd_t *pmd,
+ 	pte_t *pte)
+@@ -129,4 +131,6 @@ static inline void pmd_free(struct mm_struct *mm, pmd_t *pmd)
+ #endif
+ 
++#endif /* CONFIG_MMU */
++
+ #define check_pgt_cache()	do { } while (0)
+ 
+diff --git a/arch/mips/include/asm/pgtable.h b/arch/mips/include/asm/pgtable.h
+index 4e68c644..d3abff21 100644
+--- a/arch/mips/include/asm/pgtable.h
++++ b/arch/mips/include/asm/pgtable.h
+@@ -9,4 +9,8 @@
+ #define _ASM_PGTABLE_H
+ 
++#ifndef CONFIG_MMU
++#include <asm/pgtable_no.h>
++#else /* CONFIG_MMU */
++
+ #include <linux/mm_types.h>
+ #include <linux/mmzone.h>
+@@ -661,3 +665,5 @@ int phys_mem_access_prot_allowed(struct file *file, unsigned long pfn,
+ #define pgtable_cache_init()	do { } while (0)
+ 
++#endif /* CONFIG_MMU */
++
+ #endif /* _ASM_PGTABLE_H */
+diff --git a/arch/mips/include/asm/pgtable_no.h b/arch/mips/include/asm/pgtable_no.h
+new file mode 100644
+index 00000000..f43ab3aa
+--- /dev/null
++++ b/arch/mips/include/asm/pgtable_no.h
+@@ -0,0 +1,82 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2026 ALiLinux project
++ */
++#ifndef _ASM_PGTABLE_NO_H
++#define _ASM_PGTABLE_NO_H
++
++/*
++ * Trivial page tables for the no-MMU (fixed mapping, Config0.MT == 3)
++ * MIPS build: the core maps kseg0 and kuseg statically, so Linux never
++ * touches page tables.  The stubs below keep the generic mm code happy.
++ * Modelled on arch/m68k/include/asm/pgtable_no.h and the nommu branch
++ * of arch/microblaze/include/asm/pgtable.h.
++ */
++
++#include <linux/mm_types.h>
++#include <asm/page.h>
++
++/*
++ * pud_* is folded onto pgd_* (4-level fixup); pmd_t exists only so
++ * that generic declarations compile -- nothing allocates or walks
++ * page tables here.
++ */
++#include <asm-generic/4level-fixup.h>
++typedef struct { unsigned long pmd[16]; } pmd_t;
++#define pmd_val(x)	((x).pmd[0])
++
++#define pgd_present(pgd)	(1)
++#define pgd_none(pgd)		(0)
++#define pgd_bad(pgd)		(0)
++#define pgd_clear(pgdp)
++#define kern_addr_valid(addr)	(1)
++#define pmd_offset(a, b)	((void *)0)
++
++#define PAGE_NONE	__pgprot(0)
++#define PAGE_SHARED	__pgprot(0)
++#define PAGE_COPY	__pgprot(0)
++#define PAGE_READONLY	__pgprot(0)
++#define PAGE_KERNEL	__pgprot(0)
++#define PAGE_USERIO	__pgprot(0)
++
++/* Cache attributes are per-address-segment, not per-pte. */
++#define pgprot_noncached(prot)		(prot)
++#define pgprot_writecombine(prot)	(prot)
++
++extern void paging_init(void);
++#define swapper_pg_dir		((pgd_t *) NULL)
++
++#define __swp_type(x)		(0)
++#define __swp_offset(x)		(0)
++#define __swp_entry(typ, off)	((swp_entry_t) { ((typ) | ((off) << 7)) })
++#define __pte_to_swp_entry(pte)	((swp_entry_t) { pte_val(pte) })
++#define __swp_entry_to_pte(x)	((pte_t) { (x).val })
++
++/*
++ * No zero page on nommu: mm/nommu.c never maps it.  Make accidental
++ * uses fail loudly instead of silently handing out kernel pages.
++ */
++#define ZERO_PAGE(vaddr)	({ BUG(); NULL; })
++
++#define update_mmu_cache(vma, address, ptep)	do { } while (0)
++
++/*
++ * No page table caches to initialise.
++ */
++#define pgtable_cache_init()	do { } while (0)
++
++/*
++ * All 32bit addresses are effectively valid for vmalloc... sort of
++ * meaningless for non-VM targets.
++ */
++#define VMALLOC_START		0UL
++#define VMALLOC_END		0xffffffffUL
++
++#include <asm-generic/pgtable.h>
++
++#define check_pgt_cache()	do { } while (0)
++
++#endif /* _ASM_PGTABLE_NO_H */
+diff --git a/arch/mips/include/asm/tlbflush.h b/arch/mips/include/asm/tlbflush.h
+index 86b21de1..0405724e 100644
+--- a/arch/mips/include/asm/tlbflush.h
++++ b/arch/mips/include/asm/tlbflush.h
+@@ -4,4 +4,6 @@
+ #include <linux/mm.h>
+ 
++#ifdef CONFIG_MMU
++
+ /*
+  * TLB flushing:
+@@ -45,3 +47,7 @@ extern void flush_tlb_one(unsigned long vaddr);
+ #endif /* CONFIG_SMP */
+ 
++#else
++#include <asm-generic/tlbflush.h>
++#endif /* CONFIG_MMU */
++
+ #endif /* __ASM_TLBFLUSH_H */
+diff --git a/arch/mips/include/asm/uaccess.h b/arch/mips/include/asm/uaccess.h
+index 4f281768..74ca511b 100644
+--- a/arch/mips/include/asm/uaccess.h
++++ b/arch/mips/include/asm/uaccess.h
+@@ -55,4 +55,8 @@ extern u64 __ua_limit;
+ #endif /* CONFIG_64BIT */
+ 
++#ifndef CONFIG_MMU
++#include <asm/uaccess_no.h>
++#else /* CONFIG_MMU */
++
+ /*
+  * USER_DS is a bitmask that has the bits set that may not be set in a valid
+@@ -1496,8 +1500,10 @@ struct exception_table_entry
+ {
+ 	unsigned long insn;
+-	unsigned long nextinsn;
++	unsigned long fixup;
+ };
+ 
+ extern int fixup_exception(struct pt_regs *regs);
+ 
++#endif /* CONFIG_MMU */
++
+ #endif /* _ASM_UACCESS_H */
+diff --git a/arch/mips/include/asm/uaccess_no.h b/arch/mips/include/asm/uaccess_no.h
+new file mode 100644
+index 00000000..cc54872d
+--- /dev/null
++++ b/arch/mips/include/asm/uaccess_no.h
+@@ -0,0 +1,19 @@
++#ifndef _ASM_UACCESS_NO_H
++#define _ASM_UACCESS_NO_H
++/* nommu: userland runs in kernel mode, "user" pointers are kernel pointers */
++#include <asm/addrspace.h>
++#include <asm/page.h>
++
++extern void *high_memory;
++
++/*
++ * There is no MMU to fault a bad pointer, so access_ok() checks the range (arch/mips/mm/extable.c:
++ * RAM through KSEG0 and the uncached KSEG1 view), out of line -- it has hundreds of users.
++ */
++extern int __access_ok(unsigned long addr, unsigned long size);
++#define __access_ok __access_ok
++
++#include <asm-generic/uaccess.h>
++
++extern int fixup_exception(struct pt_regs *regs);
++#endif
+diff --git a/arch/mips/include/uapi/asm/mman.h b/arch/mips/include/uapi/asm/mman.h
+index 97c03f46..c4688912 100644
+--- a/arch/mips/include/uapi/asm/mman.h
++++ b/arch/mips/include/uapi/asm/mman.h
+@@ -50,4 +50,14 @@
+ #define MAP_HUGETLB	0x80000		/* create a huge page mapping */
+ 
++/*
++ * nommu: anonymous mmap may skip the zeroing when asked for it
++ * (same values as include/uapi/asm-generic/mman-common.h).
++ */
++#ifdef CONFIG_MMAP_ALLOW_UNINITIALIZED
++#define MAP_UNINITIALIZED	0x4000000	/* For anonymous mmap, memory could be uninitialized */
++#else
++#define MAP_UNINITIALIZED	0x0		/* Don't support this flag */
++#endif
++
+ /*
+  * Flags for msync
+diff --git a/arch/mips/kernel/asm-offsets.c b/arch/mips/kernel/asm-offsets.c
+index 7ab8004c..1c3f550b 100644
+--- a/arch/mips/kernel/asm-offsets.c
++++ b/arch/mips/kernel/asm-offsets.c
+@@ -185,4 +185,5 @@ void output_mm_defines(void)
+ 	OFFSET(MM_CONTEXT, mm_struct, context);
+ 	BLANK();
++#ifdef CONFIG_MMU
+ 	DEFINE(_PGD_T_SIZE, sizeof(pgd_t));
+ 	DEFINE(_PMD_T_SIZE, sizeof(pmd_t));
+@@ -208,4 +209,5 @@ void output_mm_defines(void)
+ 	DEFINE(_PTRS_PER_PTE, PTRS_PER_PTE);
+ 	BLANK();
++#endif
+ 	DEFINE(_PAGE_SHIFT, PAGE_SHIFT);
+ 	DEFINE(_PAGE_SIZE, PAGE_SIZE);
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index a6e76603..04d3395d 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -456,5 +456,5 @@ asmlinkage void do_be(struct pt_regs *regs)
+ 	case MIPS_BE_FIXUP:
+ 		if (fixup) {
+-			regs->cp0_epc = fixup->nextinsn;
++			regs->cp0_epc = fixup->fixup;
+ 			goto out;
+ 		}
+diff --git a/arch/mips/mm/extable.c b/arch/mips/mm/extable.c
+index 9d25d2ba..4ff9cf4a 100644
+--- a/arch/mips/mm/extable.c
++++ b/arch/mips/mm/extable.c
+@@ -17,5 +17,5 @@ int fixup_exception(struct pt_regs *regs)
+ 	fixup = search_exception_tables(exception_epc(regs));
+ 	if (fixup) {
+-		regs->cp0_epc = fixup->nextinsn;
++		regs->cp0_epc = fixup->fixup;
+ 
+ 		return 1;
+@@ -24,2 +24,31 @@ int fixup_exception(struct pt_regs *regs)
+ 	return 0;
+ }
++
++#ifndef CONFIG_MMU
++#include <linux/mm.h>
++#include <asm/addrspace.h>
++#include <asm/page.h>
++
++/*
++ * nommu access_ok(): RAM through the cached KSEG0 view (everything a process owns lives there,
++ * the kernel image too, for KERNEL_DS) and the uncached KSEG1 view that /dev/mem and /dev/fb
++ * hand out.  NULL, wild and wrapping pointers get -EFAULT instead of silently reading or writing
++ * physical memory (the exception vectors are at physical 0).  Before mem_init() high_memory is
++ * still NULL: RAM is accepted as a whole then.
++ */
++int __access_ok(unsigned long addr, unsigned long size)
++{
++	unsigned long end = addr + size;
++
++	if (!size)		/* nothing is accessed (NULL, 0 is legal, as with an MMU) */
++		return 1;
++	if (end < addr)
++		return 0;
++	if (addr >= CKSEG0 && addr < CKSEG1)
++		return end <= CKSEG1 && (!high_memory || end <= (unsigned long)high_memory);
++	if (addr >= CKSEG1 && addr < CKSEG2)
++		return end <= CKSEG2;
++	return 0;
++}
++EXPORT_SYMBOL(__access_ok);
++#endif

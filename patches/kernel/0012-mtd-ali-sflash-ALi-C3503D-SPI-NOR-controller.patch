@@ -1,0 +1,440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:41:28 +0100
+Subject: [PATCH] mtd: ali-sflash: ALi C3503D SPI NOR controller
+
+Read, 64 KB erase and page program through the SF controller; the platform
+device takes its partition table from the board (ali_board.flash_parts).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile    |   2 +-
+ arch/mips/ali-c3503d/dev-flash.c |  30 +++
+ drivers/mtd/devices/Kconfig      |   8 +
+ drivers/mtd/devices/Makefile     |   1 +
+ drivers/mtd/devices/ali-sflash.c | 343 +++++++++++++++++++++++++++++++
+ 5 files changed, 383 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/dev-flash.c
+ create mode 100644 drivers/mtd/devices/ali-sflash.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 299a5b72..48475dba 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o
+diff --git a/arch/mips/ali-c3503d/dev-flash.c b/arch/mips/ali-c3503d/dev-flash.c
+new file mode 100644
+index 00000000..a85d2d5c
+--- /dev/null
++++ b/arch/mips/ali-c3503d/dev-flash.c
+@@ -0,0 +1,30 @@
++/*
++ * ALi C3503D SPI NOR: platform device for drivers/mtd/devices/ali-sflash.c
++ *
++ * The SF controller (SF_INS/FMT/DUM/CFG at 0x1802E098) reads through a
++ * memory window at 0x0F800000 (4 MB below + 4 MB at 0x0FC00000; 0x1FC00000 is the boot ROM).  The
++ * partition table is a property of the board (ali_board.flash_parts).
++ */
++#include <linux/init.h>
++#include <linux/mtd/partitions.h>
++#include <linux/mtd/physmap.h>
++#include <linux/platform_device.h>
++
++#include "ali.h"
++
++static int __init ali_flash_init(void)
++{
++	const struct resource flash[] = {
++		DEFINE_RES_MEM(0x0F800000UL, 8 << 20),
++		DEFINE_RES_MEM(0x1802E098UL, 0x38),	/* SF_INS..SF_CS (0x1802E0C8) */
++	};
++	struct physmap_flash_data data = {
++		.parts		= (struct mtd_partition *)ali_board.flash_parts,
++		.nr_parts	= ali_board.nr_flash_parts,
++	};
++
++	WARN_ON(IS_ERR(platform_device_register_resndata(NULL, "ali-sflash", -1,
++			flash, ARRAY_SIZE(flash), &data, sizeof(data))));
++	return 0;
++}
++arch_initcall(ali_flash_init);
+diff --git a/drivers/mtd/devices/Kconfig b/drivers/mtd/devices/Kconfig
+index 5ab9a46d..822f08bc 100644
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -51,4 +51,12 @@ config MTD_MS02NV
+ 	  The module will be called ms02-nv.
+ 
++config MTD_ALI_SFLASH
++	tristate "ALi C3503D SPI NOR flash controller"
++	depends on MIPS_ALI_C3503D || COMPILE_TEST
++	help
++	  Raw MTD (read, 64 KB erase, page program) for the SPI NOR behind
++	  the ALi C3503D SF controller (SF_INS/FMT/DUM/CFG at 0x1802E098),
++	  partitioned by the board's platform data.
++
+ config MTD_DATAFLASH
+ 	tristate "Support for AT45xxx DataFlash"
+diff --git a/drivers/mtd/devices/Makefile b/drivers/mtd/devices/Makefile
+index 7912d3a0..59b3e414 100644
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -12,4 +12,5 @@ obj-$(CONFIG_MTD_LART)		+= lart.o
+ obj-$(CONFIG_MTD_BLOCK2MTD)	+= block2mtd.o
+ obj-$(CONFIG_MTD_DATAFLASH)	+= mtd_dataflash.o
++obj-$(CONFIG_MTD_ALI_SFLASH)	+= ali-sflash.o
+ obj-$(CONFIG_MTD_M25P80)	+= m25p80.o
+ obj-$(CONFIG_MTD_SPEAR_SMI)	+= spear_smi.o
+diff --git a/drivers/mtd/devices/ali-sflash.c b/drivers/mtd/devices/ali-sflash.c
+new file mode 100644
+index 00000000..7f9a2291
+--- /dev/null
++++ b/drivers/mtd/devices/ali-sflash.c
+@@ -0,0 +1,343 @@
++/*
++ * ALi C3503D SPI NOR controller (SF_INS/FMT/DUM/CFG at 0xB802E098) as a raw MTD
++ * (platform device "ali-sflash": mem 0 = 8 MB window at 0x0F800000, mem 1 = SF_INS).
++ *
++ * The controller has no FIFO: a command is latched in SF_INS (with the frame
++ * format in SF_FMT) and the next access to the flash window sends it, the
++ * window offset being the flash address and the stored/loaded bytes the data.
++ * Reads use the window in its default read mode (INS 0x03, FMT CODE|ADDR|DATA).
++ * The window shows 4 MB; above that the address bits 22-23 select the base
++ * (flash offset o -> 0x0FC00000 - (o & 0xC00000) + (o & 0x3FFFFF)), as in the
++ * ALi SDK's sflash_copy()/sflash_erase_sector() (src/lld/sto/flash_sqi); for that
++ * to decode, the size code in SF_CFG bits 7:6 must be set (probe).
++ *
++ * Writing (WREN, RDSR, RDID, erase, page program) does not go through the window's command
++ * mode: that never reached the chip (WEL stayed 0 after WREN).  The vendor Linux driver
++ * (alinor/ali_spi_bus.c) drives the controller as a raw SPI master instead, and so do we:
++ * chip select is taken over by hand (SF_CS bits 26:25 + 24 at 0x1802E0C8), SF_FMT is DATA only
++ * (every access to the window moves one raw byte; a byte b is sent by storing b at window + b),
++ * and CS is released again when the transaction is over.
++ *
++ * Licensed under the GPLv2.
++ */
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++#include <linux/mtd/physmap.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/sched.h>
++
++#define SF_INS		0
++#define SF_FMT		1
++#define SF_DUM		2
++#define SF_CFG		3
++#define SF_CS		0x30		/* 0x1802E0C8, relative to SF_INS: manual chip select */
++#define SF_CS_MANUAL	(3u << 25)
++#define SF_CS_ENABLE	(1u << 24)	/* with it set the window reads back zeros: clear it after every transaction */
++#define SF_MODE_IO	0x07		/* SF_DUM/MODE bits 2:0 = I/O mode, 0 = single */
++#define SF_CFG_SIZE	0xC0		/* flash size code, set as the SDK does (flash_sl.c): 10 = 4..8 MB */
++#define SF_HIT_DATA	0x01
++#define SF_HIT_ADDR	0x04
++#define SF_HIT_CODE	0x08
++#define SF_CONT_WR	0x80
++#define SF_READ_FMT	(SF_HIT_CODE | SF_HIT_ADDR | SF_HIT_DATA)
++
++#define SPINOR_WREN	0x06
++#define SPINOR_RDID	0x9f
++#define SPINOR_RDSR	0x05
++#define SPINOR_READ	0x03
++#define SPINOR_PP	0x02
++#define SPINOR_SE	0xd8
++#define SR_WIP		0x01
++#define SR_WEL		0x02
++
++#define SF_SIZE		(8 << 20)
++#define SF_SECTOR	0x10000
++#define SF_PAGE		0x100
++#define WINDOW_TOP	0x400000	/* offset 0 inside the 8 MB resource (physical 0x0FC00000: the boot ROM owns 0x1FC00000) */
++
++struct ali_sf {
++	struct mtd_info mtd;
++	struct mutex lock;
++	void __iomem *regs;		/* SF_INS */
++	void __iomem *win;		/* resource start (0x1F800000) */
++};
++
++static void __iomem *sf_addr(struct ali_sf *sf, u32 o)
++{
++	return sf->win + WINDOW_TOP - (o & 0xC00000) + (o & 0x3FFFFF);
++}
++
++static void sf_cmd(struct ali_sf *sf, u8 fmt, u8 ins)
++{
++	writeb(fmt, sf->regs + SF_FMT);
++	writeb(ins, sf->regs + SF_INS);
++	readb(sf->regs + SF_INS);		/* post the writes (as the SDK) */
++}
++
++static void sf_read_mode(struct ali_sf *sf)
++{
++	sf_cmd(sf, SF_READ_FMT, SPINOR_READ);
++	/* the first load after a command change returns 0 (seen on the box): burn it here */
++	readl(sf->win + WINDOW_TOP);
++}
++
++/* a raw SPI transaction: CS held low from sf_spi_begin() to sf_spi_end() */
++static void sf_spi_begin(struct ali_sf *sf)
++{
++	writel(readl(sf->regs + SF_CS) | SF_CS_MANUAL | SF_CS_ENABLE, sf->regs + SF_CS);
++	writeb(SF_HIT_DATA, sf->regs + SF_FMT);
++	writeb(readb(sf->regs + SF_DUM) & ~SF_MODE_IO, sf->regs + SF_DUM);
++}
++
++static void sf_spi_end(struct ali_sf *sf)
++{
++	/* release CS first and clear the enable bit afterwards: dropping all three at once makes the chip ignore the command (WREN never set WEL) */
++	writel(readl(sf->regs + SF_CS) & ~SF_CS_MANUAL, sf->regs + SF_CS);
++	writel(readl(sf->regs + SF_CS) & ~SF_CS_ENABLE, sf->regs + SF_CS);
++	sf_read_mode(sf);
++}
++
++static void sf_spi_tx(struct ali_sf *sf, const u8 *p, size_t n)
++{
++	void __iomem *base = sf_addr(sf, 0);
++
++	while (n--) {
++		writeb(*p, base + *p);		/* the address carries the byte, as in the vendor driver */
++		p++;
++	}
++}
++
++static u8 sf_spi_rx8(struct ali_sf *sf)
++{
++	return readb(sf_addr(sf, 0));
++}
++
++static void sf_cmd_only(struct ali_sf *sf, u8 op)
++{
++	sf_spi_begin(sf);
++	sf_spi_tx(sf, &op, 1);
++	sf_spi_end(sf);
++}
++
++static u8 sf_rdsr(struct ali_sf *sf)
++{
++	u8 op = SPINOR_RDSR, sr;
++
++	sf_spi_begin(sf);
++	sf_spi_tx(sf, &op, 1);
++	sr = sf_spi_rx8(sf);
++	sf_spi_end(sf);
++	return sr;
++}
++
++static int sf_wait(struct ali_sf *sf, unsigned int timeout_ms)
++{
++	unsigned long end = jiffies + msecs_to_jiffies(timeout_ms) + 1;
++
++	while (sf_rdsr(sf) & SR_WIP) {
++		if (time_after(jiffies, end))
++			return -ETIMEDOUT;
++		cond_resched();
++	}
++	return 0;
++}
++
++/* WREN, then check that the chip took it (WEL): without that every erase/program would silently do nothing */
++static int sf_wren(struct ali_sf *sf)
++{
++	sf_cmd_only(sf, SPINOR_WREN);
++	return (sf_rdsr(sf) & SR_WEL) ? 0 : -EIO;
++}
++
++/*
++ * Every load from the window is one SPI transaction.  memcpy_fromio() issues its loads back to back, with
++ * lwl/lwr and prefetches, and the controller returns garbage for them (a word read as 6d 00 00 00 instead of
++ * 6d 61 69 6e); single aligned 32-bit loads (busybox devmem) are right, so read like that.
++ */
++static void sf_copy_from(u8 *buf, void __iomem *a, u32 o, size_t n)
++{
++	while (n) {
++		if (!(o & 3) && n >= 4) {
++			u32 v = readl(a);
++
++			buf[0] = v, buf[1] = v >> 8, buf[2] = v >> 16, buf[3] = v >> 24;
++			a += 4, buf += 4, o += 4, n -= 4;
++		} else {
++			*buf++ = readb(a);
++			a++, o++, n--;
++		}
++	}
++}
++
++static int ali_sf_read(struct mtd_info *mtd, loff_t from, size_t len,
++		       size_t *retlen, u_char *buf)
++{
++	struct ali_sf *sf = mtd->priv;
++	u32 o = from;
++	int ret;
++
++	mutex_lock(&sf->lock);
++	ret = sf_wait(sf, 3000);	/* an earlier erase/program that timed out may still run */
++	if (ret) {
++		mutex_unlock(&sf->lock);
++		return ret;
++	}
++	while (len) {
++		size_t n = min_t(size_t, len, 0x400000 - (o & 0x3FFFFF));
++
++		sf_copy_from(buf, sf_addr(sf, o), o, n);
++		buf += n;
++		o += n;
++		len -= n;
++		*retlen += n;
++	}
++	mutex_unlock(&sf->lock);
++	return 0;
++}
++
++static int ali_sf_erase(struct mtd_info *mtd, struct erase_info *instr)
++{
++	struct ali_sf *sf = mtd->priv;
++	u32 o = instr->addr, end = instr->addr + instr->len;
++	int ret;
++
++	/* sector erase only: a misaligned range would silently wipe or skip a block */
++	if ((instr->addr | instr->len) & (SF_SECTOR - 1))
++		return -EINVAL;
++
++	mutex_lock(&sf->lock);
++	ret = sf_wait(sf, 3000);
++	for (; !ret && o < end; o += SF_SECTOR) {
++		u8 c[4] = { SPINOR_SE, o >> 16, o >> 8, o };
++
++		ret = sf_wren(sf);
++		if (ret) {
++			instr->fail_addr = o;
++			break;
++		}
++		sf_spi_begin(sf);
++		sf_spi_tx(sf, c, 4);
++		sf_spi_end(sf);
++		ret = sf_wait(sf, 3000);
++		if (ret) {
++			instr->fail_addr = o;
++			break;
++		}
++	}
++	mutex_unlock(&sf->lock);
++
++	instr->state = ret ? MTD_ERASE_FAILED : MTD_ERASE_DONE;
++	mtd_erase_callback(instr);
++	return ret;
++}
++
++/* one page program, n <= SF_PAGE and not crossing a page */
++static int sf_program(struct ali_sf *sf, u32 o, const u8 *p, size_t n)
++{
++	u8 c[4] = { SPINOR_PP, o >> 16, o >> 8, o };
++	int ret = sf_wren(sf);
++
++	if (ret)
++		return ret;
++	sf_spi_begin(sf);
++	sf_spi_tx(sf, c, 4);
++	sf_spi_tx(sf, p, n);
++	sf_spi_end(sf);
++	return sf_wait(sf, 50);
++}
++
++static int ali_sf_write(struct mtd_info *mtd, loff_t to, size_t len,
++			size_t *retlen, const u_char *buf)
++{
++	struct ali_sf *sf = mtd->priv;
++	u32 o = to;
++	int ret;
++
++	mutex_lock(&sf->lock);
++	ret = sf_wait(sf, 3000);
++	while (!ret && len) {
++		size_t n = min_t(size_t, len, SF_PAGE - (o & (SF_PAGE - 1)));
++
++		ret = sf_program(sf, o, buf, n);
++		if (ret)
++			break;
++		buf += n;
++		o += n;
++		len -= n;
++		*retlen += n;
++	}
++	mutex_unlock(&sf->lock);
++	return ret;
++}
++
++static int ali_sf_probe(struct platform_device *pdev)
++{
++	const struct physmap_flash_data *pdata = dev_get_platdata(&pdev->dev);
++	struct resource *win, *regs;
++	struct ali_sf *sf;
++
++	sf = devm_kzalloc(&pdev->dev, sizeof(*sf), GFP_KERNEL);
++	if (!sf)
++		return -ENOMEM;
++	win = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	regs = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!win || !regs || resource_size(win) != SF_SIZE)
++		return -EINVAL;
++	sf->win = devm_ioremap(&pdev->dev, win->start, SF_SIZE);
++	sf->regs = devm_ioremap(&pdev->dev, regs->start, resource_size(regs));
++	if (!sf->win || !sf->regs)
++		return -ENOMEM;
++	mutex_init(&sf->lock);
++	writel(readl(sf->regs + SF_CS) & ~(SF_CS_MANUAL | SF_CS_ENABLE), sf->regs + SF_CS);
++	/* 4..8 MB part: size code 10 in CFG[7:6] (SDK flash_sl.c); without it the upper half
++	 * of the window may decode as a mirror of the lower 4 MB */
++	writeb((readb(sf->regs + SF_CFG) & ~SF_CFG_SIZE) | 0x80, sf->regs + SF_CFG);
++	sf_read_mode(sf);
++	{
++		u8 op = SPINOR_RDID, id[3];
++
++		sf_spi_begin(sf);
++		sf_spi_tx(sf, &op, 1);
++		id[0] = sf_spi_rx8(sf), id[1] = sf_spi_rx8(sf), id[2] = sf_spi_rx8(sf);
++		sf_spi_end(sf);
++		dev_info(&pdev->dev, "JEDEC id %02x %02x %02x, status %02x\n", id[0], id[1], id[2], sf_rdsr(sf));
++	}
++
++	sf->mtd.name = "ali-sflash";
++	sf->mtd.type = MTD_NORFLASH;
++	sf->mtd.flags = MTD_CAP_NORFLASH;
++	sf->mtd.size = SF_SIZE;
++	sf->mtd.erasesize = SF_SECTOR;
++	sf->mtd.writesize = 1;
++	sf->mtd.writebufsize = SF_PAGE;
++	sf->mtd.owner = THIS_MODULE;
++	sf->mtd.dev.parent = &pdev->dev;
++	sf->mtd.priv = sf;
++	sf->mtd._read = ali_sf_read;
++	sf->mtd._write = ali_sf_write;
++	sf->mtd._erase = ali_sf_erase;
++	platform_set_drvdata(pdev, sf);
++
++	return mtd_device_register(&sf->mtd, pdata ? pdata->parts : NULL,
++				   pdata ? pdata->nr_parts : 0);
++}
++
++static int ali_sf_remove(struct platform_device *pdev)
++{
++	struct ali_sf *sf = platform_get_drvdata(pdev);
++
++	return mtd_device_unregister(&sf->mtd);
++}
++
++static struct platform_driver ali_sf_driver = {
++	.probe	= ali_sf_probe,
++	.remove	= ali_sf_remove,
++	.driver	= { .name = "ali-sflash" },
++};
++module_platform_driver(ali_sf_driver);
++MODULE_ALIAS("platform:ali-sflash");
++MODULE_LICENSE("GPL");

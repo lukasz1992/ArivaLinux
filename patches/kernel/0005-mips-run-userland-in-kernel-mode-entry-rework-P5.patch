@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Tue, 17 Nov 2026 18:05:37 +0100
+Subject: [PATCH] mips: run userland in kernel mode (entry rework): P5
+
+The fixed mapping (Config0.MT=3, no TLB) has no kuseg, so userland
+cannot run in user mode; it runs in kernel mode, KSU=0, and the
+user/kernel distinction moves to the CU0 bit, which the kernel already
+uses as its "on the kernel stack" marker (CLI/STI/KMODE set it, and
+SAVE_SOME's stack-switch test reads it).  start_thread hands out
+userland with KSU=0, CU0/CU1/CU2 off; the kernel keeps CU0 set.  A
+CP0 access from userland raises RI and lands in the rdhwr emulation
+(handle_ri_rdhwr), which works in either mode (traps.c simulate_rdhwr,
+set_thread_area via TI_TP_VALUE unchanged).
+
+entry.S: resume_userspace_check and syscall_exit_work test
+PT_STATUS & KU_USER -- always false now.  Under MIPS_NOMMU test the
+CU0 marker instead (sll 3 + bltz, the SAVE_SOME trick): a frame saved
+from userland has CU0 clear, a kernel frame has it set.  Everything
+else is unchanged: RESTORE_SOME still restores the full saved Status
+(eret only clears EXL, so the mtc0-ed value governs the return mode),
+and kernel_execve reaching syscall_exit with a rewritten frame is
+detected as "user" through the same CU0 test.
+
+scall32-o32.S: skip the TI_ADDR_LIMIT "bad stack" test under nommu --
+it assumes user sp in kuseg below 0x80000000, while the user stack
+lives in kseg0.  user_lw is already a plain lw under nommu.
+
+stackframe.h SAVE_SOME unchanged: the CU0 test selects the task's
+kernel stack (get_saved_sp -> kernelsp, updated by resume()) exactly
+as before, and RESTORE_SOME restores PT_STATUS verbatim.
+
+Verified: nommu and malta MMU=y builds.  (The runtime half of the P5
+acceptance -- a user task returning from a syscall -- comes together
+with the FDPIC loader in P6.)
+---
+ arch/mips/include/asm/ptrace.h |  7 +++++++
+ arch/mips/kernel/entry.S       | 19 +++++++++++++++++++
+ arch/mips/kernel/process.c     | 12 ++++++++++++
+ arch/mips/kernel/scall32-o32.S | 10 ++++++++++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/arch/mips/include/asm/ptrace.h b/arch/mips/include/asm/ptrace.h
+index 5241240a..3fbe8754 100644
+--- a/arch/mips/include/asm/ptrace.h
++++ b/arch/mips/include/asm/ptrace.h
+@@ -146,5 +146,12 @@ extern int ptrace_set_watch_regs(struct task_struct *child,
+  * Does the process account for user or for system time?
+  */
++#ifdef CONFIG_MIPS_NOMMU
++/* userland runs with KSU=kernel: it is told apart by CU0 (set in kernel frames, clear in
++ * userland's; see entry.S and start_thread()).  Without this a fault in a program is an Oops
++ * of the kernel instead of a signal, and user time is accounted as system time. */
++#define user_mode(regs) (!((regs)->cp0_status & ST0_CU0))
++#else
+ #define user_mode(regs) (((regs)->cp0_status & KU_MASK) == KU_USER)
++#endif
+ 
+ static inline int is_syscall_success(struct pt_regs *regs)
+diff --git a/arch/mips/kernel/entry.S b/arch/mips/kernel/entry.S
+index db07793f..1a58febc 100644
+--- a/arch/mips/kernel/entry.S
++++ b/arch/mips/kernel/entry.S
+@@ -41,7 +41,20 @@ FEXPORT(__ret_from_irq)
+  */
+ resume_userspace_check:
++#ifdef CONFIG_MIPS_NOMMU
++	/*
++	 * Userland runs in kernel mode over the fixed mapping, so KSU in
++	 * the saved Status never says user.  The kernel keeps CU0 set as
++	 * its "on the kernel stack" marker (SAVE_SOME tests the same bit):
++	 * a frame saved from userland has CU0 clear, because start_thread
++	 * hands out userland with CU0 off.
++	 */
++	LONG_L	t0, PT_STATUS(sp)
++	sll	t0, 3		# CU0 (bit 28) -> bit 31
++	bltz	t0, resume_kernel	# kernel frame
++#else
+ 	LONG_L	t0, PT_STATUS(sp)		# returning to kernel mode?
+ 	andi	t0, t0, KU_USER
+ 	beqz	t0, resume_kernel
++#endif
+ 
+ resume_userspace:
+@@ -168,7 +181,13 @@ FEXPORT(syscall_exit_partial)
+ 	SAVE_STATIC
+ syscall_exit_work:
++#ifdef CONFIG_MIPS_NOMMU
++	LONG_L	t0, PT_STATUS(sp)
++	sll	t0, 3		# CU0 marker: kernel frame has it set
++	bltz	t0, resume_kernel
++#else
+ 	LONG_L	t0, PT_STATUS(sp)		# returning to kernel mode?
+ 	andi	t0, t0, KU_USER
+ 	beqz	t0, resume_kernel
++#endif
+ 	li	t0, _TIF_WORK_SYSCALL_EXIT
+ 	and	t0, a2			# a2 is preloaded with TI_FLAGS
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index e6102775..68762918 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -61,8 +61,20 @@ void start_thread(struct pt_regs * regs, unsigned long pc, unsigned long sp)
+ 	unsigned long status;
+ 
++#ifdef CONFIG_MIPS_NOMMU
++	/*
++	 * Userland runs in kernel mode over the fixed mapping: there is no
++	 * kuseg, so there is no KSU=user to hand out.  CU0 stays clear as
++	 * the "from userland" marker SAVE_SOME and the exit paths test
++	 * (the kernel keeps it set while running on the kernel stack);
++	 * CU1/CU2 off, and there is no FPU.
++	 */
++	status = regs->cp0_status & ~(ST0_CU0|ST0_CU1|ST0_CU2|ST0_FR|KU_MASK);
++	regs->cp0_status = status;
++#else
+ 	/* New thread loses kernel privileges. */
+ 	status = regs->cp0_status & ~(ST0_CU0|ST0_CU1|ST0_FR|KU_MASK);
+ 	status |= KU_USER;
+ 	regs->cp0_status = status;
++#endif
+ 	clear_used_math();
+ 	clear_fpu_owner();
+diff --git a/arch/mips/kernel/scall32-o32.S b/arch/mips/kernel/scall32-o32.S
+index 7ee8c626..262ad014 100644
+--- a/arch/mips/kernel/scall32-o32.S
++++ b/arch/mips/kernel/scall32-o32.S
+@@ -48,4 +48,13 @@ NESTED(handle_sys, PT_SIZE, sp)
+ 	lw	t0, PT_R29(sp)		# get old user stack pointer
+ 
++#ifdef CONFIG_MIPS_NOMMU
++	/*
++	 * The "user" stack is ordinary kernel memory here (no page tables,
++	 * no kuseg): any loadable address is fair game, so the addr_limit
++	 * test is meaningless (USER_DS covers kuseg, but userland lives in
++	 * kseg0).  A wild sp dies later in the user_lw loads as a bus
++	 * error -- which is all a no-MMU kernel can offer.
++	 */
++#else
+ 	/*
+ 	 * We intentionally keep the kernel stack a little below the top of
+@@ -56,4 +65,5 @@ NESTED(handle_sys, PT_SIZE, sp)
+ 	and	t5, t4
+ 	bltz	t5, bad_stack		# -> sp is bad
++#endif
+ 
+ 	/*

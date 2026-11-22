@@ -1,0 +1,12 @@
+#!/bin/sh
+# Network: loopback, then networkd. networkd follows eth0/wlan0 hot-plug itself (USB adapters,
+# cable) and never exits; settings come from the receiver's flash (userdb). Log: /var/log/networkd.log
+case "$1" in
+start)
+	ip link set lo up
+	/bin/networkd >/var/log/networkd.log 2>&1 &
+	;;
+stop)
+	killall networkd
+	;;
+esac

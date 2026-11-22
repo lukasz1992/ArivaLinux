@@ -1,0 +1,6 @@
+#!/bin/sh
+# telnetd on port 23; logins through /bin/login (password in /etc/shadow).
+case "$1" in
+start)	telnetd ;;
+stop)	killall telnetd ;;
+esac

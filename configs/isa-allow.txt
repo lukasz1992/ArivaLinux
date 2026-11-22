@@ -1,0 +1,6 @@
+# Functions excluded from the R2 scan (verify-isa.sh --allow). Each entry: name + justification.
+# Add only after checking the disassembly that the instruction sits behind a runtime ISA-level test.
+
+# instruction_hazard(): jr.hb behind the cpu_data.options test & (MIPS32R2|MIPS64R2|...) (mask 0x380);
+# on 4Kc (MIPS32 R1) the branch is skipped.
+r4k_flush_icache_range

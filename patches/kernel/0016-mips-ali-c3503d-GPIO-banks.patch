@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:42:29 +0100
+Subject: [PATCH] mips: ali-c3503d: GPIO banks
+
+Five 32-bit banks of memory-mapped GPIOs as generic bgpio chips.  The
+direction registers are left as the bootloader set them (outputs that
+power or reset the tuner, LNB or USB must not float when Linux starts).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/Kconfig             |  2 ++
+ arch/mips/ali-c3503d/Makefile |  2 +-
+ arch/mips/ali-c3503d/gpio.c   | 55 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 58 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/gpio.c
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 31bf5d96..151d559b 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -99,4 +99,6 @@ config MIPS_ALI_C3503D
+ 	select SYS_SUPPORTS_32BIT_KERNEL
+ 	select SYS_SUPPORTS_LITTLE_ENDIAN
++	select ARCH_WANT_OPTIONAL_GPIOLIB
++	select GPIO_GENERIC if GPIOLIB
+ 	help
+ 	  ALi C3503D SoC (M36F family) as used in the Ferguson Ariva 54
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index c170fc88..1439b0ca 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o
+diff --git a/arch/mips/ali-c3503d/gpio.c b/arch/mips/ali-c3503d/gpio.c
+new file mode 100644
+index 00000000..04596b9a
+--- /dev/null
++++ b/arch/mips/ali-c3503d/gpio.c
+@@ -0,0 +1,55 @@
++/*
++ * ALi C3503D GPIO controller (Ferguson Ariva 54 and clones).
++ *
++ * Five banks of 32 pins, each with three 32-bit registers (the pin
++ * numbering is the ALi SDK's "GPIO N", bank = N/32, bit = N%32):
++ *
++ *   DO   data-out   0xB8000054 / 0xB80000D4 / 0xB80000F4 /
++ *                   0xB8000354 / 0xB8000454
++ *   DI   data-in    DO - 4
++ *   DIR  direction  DO + 4   (bit set = output)
++ *
++ * Plain memory-mapped banks: the generic basic-mmio helper does the work.
++ * An output reads back from DO (DI is only trusted for inputs); DIR is
++ * shadowed: it is left as the bootloader set it (outputs that power or reset
++ * the tuner/LNB/USB must not float when Linux starts) and read into the shadow.
++ */
++#include <linux/basic_mmio_gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/platform_device.h>
++
++#define ALI_GPIO_BASE	0xB8000000UL
++#define ALI_GPIO_BANKS	5
++
++static const u16 ali_gpio_do[ALI_GPIO_BANKS] = {
++	0x054, 0x0D4, 0x0F4, 0x354, 0x454,
++};
++
++static struct bgpio_chip ali_gpio[ALI_GPIO_BANKS];
++
++static int __init ali_gpio_init(void)
++{
++	struct platform_device *pdev;
++	int i, ret;
++
++	pdev = platform_device_register_simple("ali-gpio", -1, NULL, 0);
++	if (IS_ERR(pdev))
++		return PTR_ERR(pdev);
++
++	for (i = 0; i < ALI_GPIO_BANKS; i++) {
++		void __iomem *dout = (void __iomem *)(ALI_GPIO_BASE + ali_gpio_do[i]);
++
++		ret = bgpio_init(&ali_gpio[i], &pdev->dev, 4, dout - 4, dout, NULL,
++				 dout + 4, NULL,
++				 BGPIOF_READ_OUTPUT_REG_SET);
++		if (ret)
++			return ret;
++		ali_gpio[i].gc.base = 32 * i;
++		ret = gpiochip_add(&ali_gpio[i].gc);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++postcore_initcall(ali_gpio_init);

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Kernel modules.
+#  1. /etc/modules (optional): modules to load unconditionally, one `name [params]` per line.
+#  2. Automatic loading: the kernel runs /sbin/modalias-helper for every new device (hot-plug), which modprobes the module
+#     named by the device's MODALIAS (modules.alias is made at build time).  Devices already present are handled by
+#     going over /sys once after the helper is installed.
+#  3. /sbin/modules-free: with FREE_LOADED=1 (/etc/modules.conf) the .ko files of the loaded modules are deleted (RAM back).
+[ "$1" = start ] || exit 0
+if [ -f /etc/modules ]; then
+	while read -r line; do
+		case "$line" in ''|'#'*) continue ;; esac
+		modprobe $line || echo "S05modules: cannot load $line" >&2
+	done < /etc/modules
+fi
+echo /sbin/modalias-helper > /proc/sys/kernel/hotplug
+# (no "| while" here: busybox ash on nommu cannot run a shell loop in a pipeline)
+files=$(find /sys/devices -name modalias 2>/dev/null)
+if [ -n "$files" ]; then
+	for a in $(cat $files | sort -u); do
+		modprobe -q "$a" 2>/dev/null
+	done
+fi
+/sbin/modules-free
+exit 0

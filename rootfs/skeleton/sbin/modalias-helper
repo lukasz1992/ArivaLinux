@@ -1,0 +1,6 @@
+#!/bin/sh
+# Kernel uevent helper (/proc/sys/kernel/hotplug, set by S05modules): load the module whose alias the new device carries,
+# then give the RAM of the loaded modules' files back (modules-free).
+[ -n "$MODALIAS" ] || exit 0
+modprobe -q "$MODALIAS" && /sbin/modules-free
+exit 0

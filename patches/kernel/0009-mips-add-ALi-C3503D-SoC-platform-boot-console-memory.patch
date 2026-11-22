@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:41:01 +0100
+Subject: [PATCH] mips: add ALi C3503D SoC platform (boot, console,
+ memory, timer)
+
+The C3503D is a MIPS32 4Kc set-top-box SoC booted by the vendor ROM and
+HASH1 loader, which hand the kernel over at 0x80000200 with no firmware
+and no device tree.  This adds the platform: prom_init (EBase fix-up),
+polled early console, 8250 ttyS0, CP0 Count clock, and a struct ali_board
+hook through which board files give the RAM size, the flash partitions
+and their own devices.  Per-block drivers follow in separate patches.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/Kbuild.platforms              |   1 +
+ arch/mips/Kconfig                       |  23 ++++
+ arch/mips/ali-c3503d/Kconfig            |   8 ++
+ arch/mips/ali-c3503d/Makefile           |   5 +
+ arch/mips/ali-c3503d/Platform           |  12 ++
+ arch/mips/ali-c3503d/ali.h              |  40 +++++++
+ arch/mips/ali-c3503d/setup.c            | 151 ++++++++++++++++++++++++
+ arch/mips/include/asm/mach-ali/io.h     |   9 ++
+ arch/mips/include/asm/mach-ali/spaces.h |  10 ++
+ 9 files changed, 259 insertions(+)
+ create mode 100644 arch/mips/ali-c3503d/Kconfig
+ create mode 100644 arch/mips/ali-c3503d/Makefile
+ create mode 100644 arch/mips/ali-c3503d/Platform
+ create mode 100644 arch/mips/ali-c3503d/ali.h
+ create mode 100644 arch/mips/ali-c3503d/setup.c
+ create mode 100644 arch/mips/include/asm/mach-ali/io.h
+ create mode 100644 arch/mips/include/asm/mach-ali/spaces.h
+
+diff --git a/arch/mips/Kbuild.platforms b/arch/mips/Kbuild.platforms
+index a96c81d1..cb8db102 100644
+--- a/arch/mips/Kbuild.platforms
++++ b/arch/mips/Kbuild.platforms
+@@ -1,4 +1,5 @@
+ # All platforms listed in alphabetic order
+ 
++platforms += ali-c3503d
+ platforms += alchemy
+ platforms += ar7
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 59b39994..31bf5d96 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -87,4 +87,26 @@ config MIPS_ALCHEMY
+ 	select COMMON_CLK
+ 
++config MIPS_ALI_C3503D
++	bool "ALi C3503D based set-top boxes"
++	select BOOT_RAW
++	select CEVT_R4K
++	select CSRC_R4K
++	select DMA_NONCOHERENT	# the 4Kc caches are not coherent with the USB/GE/DMA engines
++	select IRQ_MIPS_CPU
++	select MIPS_NOMMU
++	select SYS_HAS_CPU_MIPS32_R1
++	select SYS_HAS_EARLY_PRINTK
++	select SYS_SUPPORTS_32BIT_KERNEL
++	select SYS_SUPPORTS_LITTLE_ENDIAN
++	help
++	  ALi C3503D SoC (M36F family) as used in the Ferguson Ariva 54
++	  and similar DVB set-top boxes.  Single MIPS 4K-family core
++	  (PRId 0x18055, MIPS32 release 1, fixed-mapping MMU: Config0.MT=3,
++	  no TLB), 16 KiB I/D caches, CP0 Count/Compare timer, 128 MiB DDR
++	  SDRAM, SPI NOR flash.  Linux boots as the replacement of the
++	  vendor "maincode" chunk: the boot ROM and HASH1 bootloader jump
++	  to 0x80000200 with Status = 0 and no firmware services.
++	  The core has no TLB, so this platform needs the no-MMU MIPS work.
++
+ config AR7
+ 	bool "Texas Instruments AR7"
+@@ -979,4 +1001,5 @@ endchoice
+ 
+ source "arch/mips/alchemy/Kconfig"
++source "arch/mips/ali-c3503d/Kconfig"
+ source "arch/mips/ath25/Kconfig"
+ source "arch/mips/ath79/Kconfig"
+diff --git a/arch/mips/ali-c3503d/Kconfig b/arch/mips/ali-c3503d/Kconfig
+new file mode 100644
+index 00000000..9b951983
+--- /dev/null
++++ b/arch/mips/ali-c3503d/Kconfig
+@@ -0,0 +1,8 @@
++# Boards built around the ALi C3503D (one board file each, see ali.h)
++if MIPS_ALI_C3503D
++
++menu "ALi C3503D boards"
++
++endmenu
++
++endif
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+new file mode 100644
+index 00000000..84f7da01
+--- /dev/null
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -0,0 +1,5 @@
++#
++# Makefile for the ALi C3503D SoC platform
++#
++
++obj-y := setup.o
+diff --git a/arch/mips/ali-c3503d/Platform b/arch/mips/ali-c3503d/Platform
+new file mode 100644
+index 00000000..3a3d1ca5
+--- /dev/null
++++ b/arch/mips/ali-c3503d/Platform
+@@ -0,0 +1,12 @@
++#
++# ALi C3503D set-top-box SoC (Ferguson Ariva 54 and clones)
++#
++# The vendor boot chain (boot ROM + HASH1 bootloader) decompresses the
++# "maincode" chunk to 0x80000000 and jumps to its entry at 0x80000200
++# with Status = 0.  Linux replaces the maincode chunk, so the kernel
++# image is linked for physical 0x80000200 (kseg0 0xffffffff80000200)
++# and the image tool prepends 0x200 bytes of padding to the payload.
++#
++platform-$(CONFIG_MIPS_ALI_C3503D)	+= ali-c3503d/
++cflags-$(CONFIG_MIPS_ALI_C3503D)	+= -I$(srctree)/arch/mips/include/asm/mach-ali
++load-$(CONFIG_MIPS_ALI_C3503D)		+= 0xffffffff80000200
+diff --git a/arch/mips/ali-c3503d/ali.h b/arch/mips/ali-c3503d/ali.h
+new file mode 100644
+index 00000000..219ebda6
+--- /dev/null
++++ b/arch/mips/ali-c3503d/ali.h
+@@ -0,0 +1,40 @@
++/*
++ * ALi C3503D platform: definitions shared by the SoC code, the per-block
++ * device registration files and the board files.
++ */
++#ifndef __ALI_C3503D_H
++#define __ALI_C3503D_H
++
++#include <linux/init.h>
++#include <linux/ioport.h>
++#include <asm/irq.h>
++#include <asm/irq_cpu.h>
++
++/* IRQ numbering: the CPU IPs 0..7 sit below, INTC bit N = Linux IRQ N+8. */
++#define ALI_INTC_IRQ_BASE	(MIPS_CPU_IRQ_BASE + 8)
++
++struct mtd_partition;
++
++/*
++ * What differs between boards built around the C3503D: how much RAM the
++ * kernel may use, the SPI NOR partition table and the board's own devices
++ * (front panel, ...).  Exactly one board file defines ali_board; without
++ * one the weak default in setup.c applies.
++ */
++struct ali_board {
++	const char *name;
++	unsigned long ram_size;			/* bytes handed to the allocator, from 0 */
++	const struct mtd_partition *flash_parts;
++	unsigned int nr_flash_parts;
++	void (*init)(void);			/* register board-specific devices */
++};
++
++extern const struct ali_board ali_board;
++
++/* Register a platform device without platform data (SoC blocks). */
++void __init ali_add(const char *name, int id, const struct resource *res,
++		    unsigned int nres);
++
++void __init ali_intc_init(void);
++
++#endif /* __ALI_C3503D_H */
+diff --git a/arch/mips/ali-c3503d/setup.c b/arch/mips/ali-c3503d/setup.c
+new file mode 100644
+index 00000000..4caf6fbc
+--- /dev/null
++++ b/arch/mips/ali-c3503d/setup.c
+@@ -0,0 +1,151 @@
++/*
++ * ALi C3503D SoC platform: boot entry, console, memory and timer
++ *
++ * Linux runs as the replacement of the vendor "maincode" chunk: the boot
++ * ROM and HASH1 bootloader decompress it to 0x80000000 and jump to the
++ * entry at 0x80000200 with a0 = 0x80000200, a1 = 0x40, Status = 0.
++ * There is no firmware and no device tree: everything is fixed by the
++ * SoC, hence the hard-coded constants below (cross-checked against the
++ * vendor PDK drivers and AliSimulator).  What differs between boards
++ * lives in the board files (struct ali_board, see ali.h).
++ *
++ * Register map used here (kseg1 uncached view):
++ *   UART0      0xB8018300  16550-class, byte-spaced regs, 115200 8n1
++ */
++#include <linux/init.h>
++#include <linux/irq.h>
++#include <linux/io.h>
++#include <linux/platform_device.h>
++#include <linux/serial_8250.h>
++
++#include <asm/bootinfo.h>
++#include <asm/irq.h>
++#include <asm/irq_cpu.h>
++#include <asm/time.h>
++
++#include "ali.h"
++
++/* UART0: 16550-class, byte-spaced registers (regshift 0), polled. */
++#define ALI_UART0_PHYS		0x18018300UL	/* physical */
++#define ALI_UART0_BASE		0xB8018300UL	/* kseg1 */
++#define ALI_UART0_THR		0
++#define ALI_UART0_LSR		5
++#define ALI_UART_LSR_THRE	0x20
++
++/*
++ * CP0 Count rate: 225 MHz on the box (measured 2026-11-21).  The watchdog counter at 0xB8018500 ticks at
++ * 27 MHz / 32 = 843750 Hz (ali-wdt); in the window a bare payload took for 20 ms of Count it counted
++ * 18794 ticks = 22.27 ms, i.e. Count = 225.0 MHz.  That agrees with the strap (0xB8000070 bits 10:8 = 1:
++ * 450 MHz core, Count = core / 2).  AliSimulator models the C3503D with Count at 100 MHz (count_hz in
++ * src/simulator.py), which is what an emulated kernel would need.
++ */
++#define ALI_COUNT_CLOCK		225000000
++
++void __init prom_init(void)
++{
++	unsigned long sr;
++
++	/* No firmware arguments; the built-in command line is all we get. */
++
++	/*
++	 * The loader enters the kernel with EBase = 0x81002000 (stage 2's own vector page,
++	 * measured on the box 2026-11-21: bare payload, ebase_at_entry), so every exception
++	 * and interrupt would vector into the loader, which resets the chip.  Point EBase at
++	 * 0x80000000, where trap_init() installs the vectors.  Like Linux's own EBase writes
++	 * and the vendor maincode this is done with Status.BEV set (without it the write is
++	 * ignored on this core); no exception can happen in the window.
++	 */
++	sr = set_c0_status(ST0_BEV);
++	write_c0_ebase(0x80000000);
++	write_c0_status(sr);
++}
++
++/* Nothing to release: no firmware reservations in RAM. */
++void __init prom_free_prom_memory(void)
++{
++}
++
++const char *get_system_type(void)
++{
++	return "ALi C3503D";
++}
++
++void prom_putchar(char c)
++{
++	volatile u8 *uart = (volatile u8 *)ALI_UART0_BASE;
++
++	int tries = 1000000;		/* a wedged UART must not hang the box in printk */
++
++	while (!(uart[ALI_UART0_LSR] & ALI_UART_LSR_THRE))
++		if (!--tries)
++			return;
++	uart[ALI_UART0_THR] = (u8)c;
++}
++
++void __init plat_mem_setup(void)
++{
++	add_memory_region(0, ali_board.ram_size, BOOT_MEM_RAM);
++}
++
++void __init plat_time_init(void)
++{
++	/*
++	 * CP0 Count/Compare drives both clockevent (IP7) and clocksource.
++	 * AliSimulator models Count ticking at 100 MHz of emulation time
++	 * (count_hz in src/simulator.py) -- Linux reads Count directly, so
++	 * it must be told the Count rate itself, not core/2.
++	 */
++	mips_hpt_frequency = ALI_COUNT_CLOCK;
++}
++
++/*
++ * ttyS0 via the 8250 core, after the vendor driver aliuart/ali_8250_uart.c
++ * (uartclk 115200*16, PORT_16550A, byte-spaced UPIO_MEM).  UPF_IOREMAP
++ * routes through ioremap_nocache(0x18018300) -> ioremap-nommu -> kseg1,
++ * which lands back on the physical 0xB8018300 view prom_putchar uses.
++ *
++ * Polled for now: the UART's interrupt is INTC bit 16 (vendor aliuart, IRQ
++ * ALI_INTC_IRQ_BASE + 16), but AliSimulator does not drive that line for
++ * this UART (RX goes through its TDS path, no THRE interrupt), so with the
++ * irq set the console stalls in the emulator.  Switch .irq once the model does.
++ */
++static struct plat_serial8250_port ali_uart0_platform_data[] = {
++	{
++		.mapbase	= ALI_UART0_PHYS,
++		.irq		= 0,	/* ALI_INTC_IRQ_BASE + 16 */
++		.uartclk	= 115200 * 16,
++		.iotype		= UPIO_MEM,
++		.flags		= UPF_IOREMAP | UPF_FIXED_TYPE | UPF_SKIP_TEST,
++		.type		= PORT_16550A,
++	},
++	{ },
++};
++
++void __init ali_add(const char *name, int id, const struct resource *res,
++		    unsigned int nres)
++{
++	WARN_ON(IS_ERR(platform_device_register_simple(name, id, res, nres)));
++}
++
++/* Boards override this by defining ali_board; this one only gives the console and RAM. */
++const struct ali_board ali_board __weak = {
++	.name		= "generic",
++	.ram_size	= 63u << 20,
++};
++
++static int __init ali_devices_init(void)
++{
++	WARN_ON(IS_ERR(platform_device_register_data(NULL, "serial8250",
++			PLAT8250_DEV_PLATFORM, ali_uart0_platform_data,
++			sizeof(ali_uart0_platform_data))));
++	if (ali_board.init)
++		ali_board.init();
++	return 0;
++}
++arch_initcall(ali_devices_init);
++
++void __init arch_init_irq(void)
++{
++	/* CP0 IPs only; the ALi INTC cascades on IP3 (see irq.c). */
++	mips_cpu_irq_init();
++}
+diff --git a/arch/mips/include/asm/mach-ali/io.h b/arch/mips/include/asm/mach-ali/io.h
+new file mode 100644
+index 00000000..3205097d
+--- /dev/null
++++ b/arch/mips/include/asm/mach-ali/io.h
+@@ -0,0 +1,9 @@
++/*
++ * ALi C3503D: no ISA/PCI port space, generic MMIO accessors.
++ */
++#ifndef __ASM_MACH_ALI_IO_H
++#define __ASM_MACH_ALI_IO_H
++
++#include <asm/mach-generic/io.h>
++
++#endif /* __ASM_MACH_ALI_IO_H */
+diff --git a/arch/mips/include/asm/mach-ali/spaces.h b/arch/mips/include/asm/mach-ali/spaces.h
+new file mode 100644
+index 00000000..5742b1bd
+--- /dev/null
++++ b/arch/mips/include/asm/mach-ali/spaces.h
+@@ -0,0 +1,10 @@
++/*
++ * ALi C3503D: standard MIPS32 kseg0/kseg1/kuseg split.
++ * All SoC registers live in kseg1 (0xB8xxxxxx uncached).
++ */
++#ifndef __ASM_MACH_ALI_SPACES_H
++#define __ASM_MACH_ALI_SPACES_H
++
++#include <asm/mach-generic/spaces.h>
++
++#endif /* __ASM_MACH_ALI_SPACES_H */

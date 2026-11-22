@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:47:03 +0100
+Subject: [PATCH] mips: ali-c3503d: Ferguson Ariva 54 board
+
+Board file for the Ariva 54: 64 MiB RAM (63 MiB for the kernel), the SPI NOR
+partition table (only maincode and userdb writable), the FD650K front panel
+on a bit-banged i2c bus and the RCU540 remote's keymap.  The panel
+indicators are wired to the DP lines of the digit positions: red standby LED
+on reg 3, green lock LED on reg 1 and the colon on reg 0, as confirmed by
+lighting each one on the box.  A Kconfig choice selects the board so that
+further boards can be added next to this one.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Kconfig         |   9 +++
+ arch/mips/ali-c3503d/Makefile        |   1 +
+ arch/mips/ali-c3503d/board-ariva54.c | 112 +++++++++++++++++++++++++++
+ 3 files changed, 122 insertions(+)
+ create mode 100644 arch/mips/ali-c3503d/board-ariva54.c
+
+diff --git a/arch/mips/ali-c3503d/Kconfig b/arch/mips/ali-c3503d/Kconfig
+index 9b951983..2cf198e8 100644
+--- a/arch/mips/ali-c3503d/Kconfig
++++ b/arch/mips/ali-c3503d/Kconfig
+@@ -4,4 +4,13 @@ if MIPS_ALI_C3503D
+ menu "ALi C3503D boards"
+ 
++comment "Select exactly one board"
++
++config ALI_BOARD_ARIVA54
++	bool "Ferguson Ariva 54 (RCU540 remote)"
++	help
++	  Ferguson Ariva 54 DVB-S2 receiver: 64 MiB RAM, 8 MiB SPI NOR,
++	  FD650K front panel.  The board file supplies the RAM size, the
++	  flash partition table, the front panel and the remote's keymap.
++
+ endmenu
+ 
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index 81747b23..940bfebd 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -5,2 +5,3 @@
+ obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc.o i2c-scb.o otp.o
+ obj-$(CONFIG_DEBUG_FS) += debug.o
++obj-$(CONFIG_ALI_BOARD_ARIVA54) += board-ariva54.o
+diff --git a/arch/mips/ali-c3503d/board-ariva54.c b/arch/mips/ali-c3503d/board-ariva54.c
+new file mode 100644
+index 00000000..098a2bad
+--- /dev/null
++++ b/arch/mips/ali-c3503d/board-ariva54.c
+@@ -0,0 +1,112 @@
++/*
++ * Ferguson Ariva 54 (A54): board description for the ALi C3503D platform
++ *
++ * RAM size, the SPI NOR partition table, the FD650K front panel on a
++ * bit-banged i2c bus and the RCU540 remote's keymap.
++ */
++#include <linux/i2c-gpio.h>
++#include <linux/input.h>
++#include <linux/kernel.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++#include <linux/platform_data/fd650.h>
++#include <linux/platform_device.h>
++#include <media/rc-map.h>
++
++#include "ali.h"
++
++/*
++ * DDR SDRAM: 64 MiB at 0x00000000 on the A54 (measured on the box: an uncached write/readback probe sees RAM up
++ * to 64 MiB and only the bus latch above).  AliSimulator models 128 MiB.
++ *
++ * The kernel is given 63 MiB: `cat /proc/<pid>/cmdline` hung the chip hard (no oops, watchdog reset) because the
++ * process stack of the FDPIC binaries sits in the last page below 0x84000000 and the copy routines prefetch
++ * (pref, up to 256 bytes ahead) past it; a cached access beyond the DRAM never completes.  The last MiB also holds
++ * the vendor SEE private/shared windows (0xB8041010: 0x03F52000..0x04000000).  Keep it out of the allocator.
++ */
++#define ARIVA54_RAM_SIZE	(63u << 20)
++
++/*
++ * SPI NOR (W25Q64, 8 MB).  Partitions follow the A54 chunk chain (mkabs --verify).  The boot loader walks the
++ * whole chain: an erased chunk header anywhere stops the box before Linux, so only regions that hold no other
++ * chunk's header are writable:
++ *   maincode  0x130000..0x57ffff  its own header + data (update), stops below the erase block holding the
++ *                                 osd_string header (0x58d400);
++ *   userdb    0x700000..0x7fffff  channel DB + settings (tmp_info), header at 0x6fff80 kept.
++ */
++static const struct mtd_partition ariva54_flash_parts[] = {
++	{ .name = "hash1",      .offset = 0x000000, .size = 0x02fe00, .mask_flags = MTD_WRITEABLE },
++	{ .name = "hdcpkey",    .offset = 0x02fe00, .size = 0x000200, .mask_flags = MTD_WRITEABLE },
++	{ .name = "ota_loader", .offset = 0x030000, .size = 0x100000, .mask_flags = MTD_WRITEABLE },
++	{ .name = "maincode",   .offset = 0x130000, .size = 0x450000 },
++	{ .name = "osd_string", .offset = 0x58d400, .size = 0x022c00, .mask_flags = MTD_WRITEABLE },
++	{ .name = "data0",      .offset = 0x5b0000, .size = 0x110000, .mask_flags = MTD_WRITEABLE },	/* Ariva54, seeback */
++	{ .name = "defaultdb",  .offset = 0x6c0000, .size = 0x040000, .mask_flags = MTD_WRITEABLE },	/* + userdb header */
++	{ .name = "userdb",     .offset = 0x700000, .size = 0x100000 },
++};
++
++/*
++ * The FD650K panel bus (i2c-gpio).  The ALi pins are push-pull, so SDA cannot be open drain by setting the value
++ * high (that drives the line and stops the chip from acknowledging, -ENXIO on every address).  As the vendor
++ * firmware does (DO kept 0, only DIR switched), SDA is released by making it an input and pulled low by making it
++ * an output: i2c-gpio's default SDA mode.  SCL is push-pull and never stretched.
++ */
++#define ARIVA54_PANEL_I2C_BUS	8
++
++static const struct i2c_gpio_platform_data ariva54_panel_i2c = {
++	.sda_pin = 23, .scl_pin = 24, .udelay = 5,
++	.scl_is_output_only = 1,
++};
++
++/*
++ * FD650K front panel (drivers/auxdisplay/fd650.c), wiring from the A54's own driver (PAN_FD650K; identical to the
++ * Ariva T650i's): leftmost position = digit register 2 (0x6C), segments a..g, DP on bits 1, 5, 6, 0, 7, 2, 4, 3 of a
++ * digit byte.  Keys (row KI, column DIG): the A54 front panel has only three, power, down and up; the vendor key
++ * table lists more positions, which this board does not populate (confirmed by pressing each button).
++ */
++static const struct fd650_key ariva54_panel_keys[] = {
++	{ 4, 1, KEY_DOWN },
++	{ 6, 2, KEY_POWER },
++	{ 7, 1, KEY_UP },
++};
++
++/*
++ * The indicators hang on the DP lines of the digit positions (confirmed on the box by lighting each DP):
++ * position 2 (reg 3) the red standby LED, position 3 (reg 1) the green lock LED, position 4 (reg 0) the colon;
++ * position 1 (reg 2) drives nothing visible.
++ */
++static const struct fd650_led ariva54_panel_leds[] = {
++	{ .name = "a54:red:standby",   .reg = 3 },
++	{ .name = "a54:green:lock",    .reg = 1 },
++	{ .name = "a54:green:colon",   .reg = 0 },
++};
++
++static const struct fd650_platform_data ariva54_panel_data = {
++	.i2c_bus	= ARIVA54_PANEL_I2C_BUS,
++	.digit_reg	= { 2, 3, 1, 0 },
++	.seg_map	= { 1, 5, 6, 0, 7, 2, 4, 3 },
++	.keys		= ariva54_panel_keys,
++	.nkeys		= ARRAY_SIZE(ariva54_panel_keys),
++	.leds		= ariva54_panel_leds,
++	.nleds		= ARRAY_SIZE(ariva54_panel_leds),
++	.poll_ms	= 50,
++	.brightness	= 3,		/* the vendor's boot setting (ctrl 0x31) */
++	.boot_text	= " On ",
++};
++
++static void ariva54_init(void)
++{
++	WARN_ON(IS_ERR(platform_device_register_data(NULL, "i2c-gpio", ARIVA54_PANEL_I2C_BUS,
++			&ariva54_panel_i2c, sizeof(ariva54_panel_i2c))));
++	WARN_ON(IS_ERR(platform_device_register_data(NULL, "fd650", -1,
++			&ariva54_panel_data, sizeof(ariva54_panel_data))));
++}
++
++const struct ali_board ali_board = {
++	.name		= "Ferguson Ariva 54",
++	.ram_size	= ARIVA54_RAM_SIZE,
++	.flash_parts	= ariva54_flash_parts,
++	.nr_flash_parts	= ARRAY_SIZE(ariva54_flash_parts),
++	.ir_map		= RC_MAP_FERGUSON_RCU540,
++	.init		= ariva54_init,
++};

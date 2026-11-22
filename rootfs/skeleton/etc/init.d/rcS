@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start-up: file systems, then every /etc/init.d/S??* in order with "start".
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /tmp /var/log
+mount -t devpts devpts /dev/pts
+hostname -F /etc/hostname
+for s in /etc/init.d/S??*; do
+	[ -x "$s" ] && "$s" start
+done
+echo "=== rcS done ==="

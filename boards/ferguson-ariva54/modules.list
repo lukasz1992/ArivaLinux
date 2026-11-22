@@ -1,0 +1,7 @@
+# Kernel modules of the Ferguson Ariva 54 (scripts/pack-modules.py): only the WiFi drivers.  `name [params]` is loaded at
+# boot (/etc/modules); `?name` is only shipped and loaded automatically when a matching device shows up (modules.alias,
+# /sbin/modalias-helper), so only the family of the dongle that is really plugged in uses RAM.  Dependencies come along
+# automatically; modules not named here are not in the initramfs at all.
+?rt2800usb
+?rtl8xxxu
+?mt7601u

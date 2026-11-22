@@ -1,0 +1,245 @@
+diff --git a/net/mac80211/Kconfig b/net/mac80211/Kconfig
+index 3891cbd2..260c820d 100644
+--- a/net/mac80211/Kconfig
++++ b/net/mac80211/Kconfig
+@@ -3,5 +3,5 @@ config MAC80211
+ 	depends on CFG80211
+ 	select CRYPTO
+-	select CRYPTO_ARC4
++	select CRYPTO_ARC4 if !MAC80211_NO_LEGACY_CIPHERS
+ 	select CRYPTO_AES
+ 	select CRYPTO_CCM
+@@ -20,4 +20,21 @@ config MAC80211_HAS_RC
+ 	bool
+ 
++config MAC80211_NO_LEGACY_CIPHERS
++	bool "Do not offer WEP and TKIP"
++	default n
++	---help---
++	  Build mac80211 without WEP, TKIP and Michael MIC (stubs refuse
++	  them) and leave them out of the offered cipher suites, so only
++	  CCMP, GCMP and the BIP ciphers can be used.  If unsure, say N.
++
++config MAC80211_STATION_ONLY
++	bool "Station interfaces only"
++	default n
++	---help---
++	  Offer only station (client) and monitor interfaces, whatever the
++	  driver supports: no AP, ad-hoc (IBSS), WDS or mesh, and no
++	  multi-interface combinations.  The IBSS code is not built.
++	  If unsure, say N.
++
+ config MAC80211_RC_MINSTREL
+ 	bool "Minstrel" if EXPERT
+diff --git a/net/mac80211/Makefile b/net/mac80211/Makefile
+index f9137a83..9eccd51f 100644
+--- a/net/mac80211/Makefile
++++ b/net/mac80211/Makefile
+@@ -1,4 +1,5 @@
+ obj-$(CONFIG_MAC80211) += mac80211.o
+ 
++
+ # mac80211 objects
+ mac80211-y := \
+@@ -6,14 +7,10 @@ mac80211-y := \
+ 	driver-ops.o \
+ 	sta_info.o \
+-	wep.o \
+ 	wpa.o \
+ 	scan.o offchannel.o \
+ 	ht.o agg-tx.o agg-rx.o \
+ 	vht.o \
+-	ibss.o \
+ 	iface.o \
+ 	rate.o \
+-	michael.o \
+-	tkip.o \
+ 	aes_ccm.o \
+ 	aes_gcm.o \
+@@ -33,4 +30,11 @@ mac80211-y := \
+ 	ocb.o
+ 
++ifeq ($(CONFIG_MAC80211_STATION_ONLY),)
++mac80211-y += ibss.o
++endif
++ifeq ($(CONFIG_MAC80211_NO_LEGACY_CIPHERS),)
++mac80211-y += wep.o michael.o tkip.o
++endif
++
+ mac80211-$(CONFIG_MAC80211_LEDS) += led.o
+ mac80211-$(CONFIG_MAC80211_DEBUGFS) += \
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index d1568ad7..a74baa88 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1504,4 +1504,21 @@ void ieee80211_sta_handle_tspec_ac_params(struct ieee80211_sub_if_data *sdata);
+ 
+ /* IBSS code */
++#ifdef CONFIG_MAC80211_STATION_ONLY
++/* no ad-hoc interfaces (main.c): ibss.c is not built */
++static inline void ieee80211_ibss_notify_scan_completed(struct ieee80211_local *local) {}
++static inline void ieee80211_ibss_setup_sdata(struct ieee80211_sub_if_data *sdata) {}
++static inline void ieee80211_ibss_rx_no_sta(struct ieee80211_sub_if_data *sdata,
++					    const u8 *bssid, const u8 *addr, u32 supp_rates) {}
++static inline int ieee80211_ibss_join(struct ieee80211_sub_if_data *sdata,
++				      struct cfg80211_ibss_params *params) { return -EOPNOTSUPP; }
++static inline int ieee80211_ibss_leave(struct ieee80211_sub_if_data *sdata) { return -EOPNOTSUPP; }
++static inline void ieee80211_ibss_work(struct ieee80211_sub_if_data *sdata) {}
++static inline void ieee80211_ibss_rx_queued_mgmt(struct ieee80211_sub_if_data *sdata,
++						 struct sk_buff *skb) {}
++static inline int ieee80211_ibss_csa_beacon(struct ieee80211_sub_if_data *sdata,
++					    struct cfg80211_csa_settings *csa_settings) { return -EOPNOTSUPP; }
++static inline int ieee80211_ibss_finish_csa(struct ieee80211_sub_if_data *sdata) { return -EOPNOTSUPP; }
++static inline void ieee80211_ibss_stop(struct ieee80211_sub_if_data *sdata) {}
++#else
+ void ieee80211_ibss_notify_scan_completed(struct ieee80211_local *local);
+ void ieee80211_ibss_setup_sdata(struct ieee80211_sub_if_data *sdata);
+@@ -1518,4 +1535,5 @@ int ieee80211_ibss_csa_beacon(struct ieee80211_sub_if_data *sdata,
+ int ieee80211_ibss_finish_csa(struct ieee80211_sub_if_data *sdata);
+ void ieee80211_ibss_stop(struct ieee80211_sub_if_data *sdata);
++#endif
+ 
+ /* OCB code */
+diff --git a/net/mac80211/main.c b/net/mac80211/main.c
+index 3cf36108..16e2f5e8 100644
+--- a/net/mac80211/main.c
++++ b/net/mac80211/main.c
+@@ -742,4 +742,9 @@ static int ieee80211_init_cipher_suites(struct ieee80211_local *local)
+ 			local->hw.wiphy->cipher_suites += 2;
+ 			local->hw.wiphy->n_cipher_suites -= 2;
++			/* TKIP is the next entry */
++			if (IS_ENABLED(CONFIG_MAC80211_NO_LEGACY_CIPHERS)) {
++				local->hw.wiphy->cipher_suites += 1;
++				local->hw.wiphy->n_cipher_suites -= 1;
++			}
+ 		}
+ 
+@@ -807,4 +812,25 @@ static int ieee80211_init_cipher_suites(struct ieee80211_local *local)
+ }
+ 
++#ifdef CONFIG_MAC80211_NO_LEGACY_CIPHERS
++/* TKIP helpers for drivers with hardware TKIP: never reached (no TKIP keys) */
++void ieee80211_get_tkip_p1k_iv(struct ieee80211_key_conf *keyconf, u32 iv32, u16 *p1k)
++{
++	memset(p1k, 0, 5 * sizeof(u16));
++}
++EXPORT_SYMBOL(ieee80211_get_tkip_p1k_iv);
++
++void ieee80211_get_tkip_rx_p1k(struct ieee80211_key_conf *keyconf, const u8 *ta, u32 iv32, u16 *p1k)
++{
++	memset(p1k, 0, 5 * sizeof(u16));
++}
++EXPORT_SYMBOL(ieee80211_get_tkip_rx_p1k);
++
++void ieee80211_get_tkip_p2k(struct ieee80211_key_conf *keyconf, struct sk_buff *skb, u8 *p2k)
++{
++	memset(p2k, 0, 16);
++}
++EXPORT_SYMBOL(ieee80211_get_tkip_p2k);
++#endif
++
+ int ieee80211_register_hw(struct ieee80211_hw *hw)
+ {
+@@ -941,4 +967,9 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
+ 
+ 	/* mac80211 always supports monitor */
++	if (IS_ENABLED(CONFIG_MAC80211_STATION_ONLY)) {
++		hw->wiphy->interface_modes &= BIT(NL80211_IFTYPE_STATION);
++		hw->wiphy->iface_combinations = NULL;
++		hw->wiphy->n_iface_combinations = 0;
++	}
+ 	hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
+ 	hw->wiphy->software_iftypes |= BIT(NL80211_IFTYPE_MONITOR);
+diff --git a/net/mac80211/michael.h b/net/mac80211/michael.h
+index 0e4886f8..b158bdea 100644
+--- a/net/mac80211/michael.h
++++ b/net/mac80211/michael.h
+@@ -12,4 +12,5 @@
+ 
+ #include <linux/types.h>
++#include <linux/string.h>
+ #include <linux/ieee80211.h>
+ 
+@@ -20,6 +21,14 @@ struct michael_mic_ctx {
+ };
+ 
++#ifdef CONFIG_MAC80211_NO_LEGACY_CIPHERS
++static inline void michael_mic(const u8 *key, struct ieee80211_hdr *hdr,
++			       const u8 *data, size_t data_len, u8 *mic)
++{
++	memset(mic, 0, MICHAEL_MIC_LEN);
++}
++#else
+ void michael_mic(const u8 *key, struct ieee80211_hdr *hdr,
+ 		 const u8 *data, size_t data_len, u8 *mic);
++#endif
+ 
+ #endif /* MICHAEL_H */
+diff --git a/net/mac80211/tkip.h b/net/mac80211/tkip.h
+index e3ecb659..4083a450 100644
+--- a/net/mac80211/tkip.h
++++ b/net/mac80211/tkip.h
+@@ -14,4 +14,10 @@
+ #include "key.h"
+ 
++#ifdef CONFIG_MAC80211_NO_LEGACY_CIPHERS
++static inline u8 *ieee80211_tkip_add_iv(u8 *pos, struct ieee80211_key *key) { return pos; }
++static inline int ieee80211_tkip_encrypt_data(struct crypto_cipher *tfm, struct ieee80211_key *key,
++					      struct sk_buff *skb, u8 *payload, size_t payload_len)
++{ return -1; }
++#else
+ u8 *ieee80211_tkip_add_iv(u8 *pos, struct ieee80211_key *key);
+ 
+@@ -20,4 +26,5 @@ int ieee80211_tkip_encrypt_data(struct crypto_cipher *tfm,
+ 				struct sk_buff *skb,
+ 				u8 *payload, size_t payload_len);
++#endif
+ 
+ enum {
+@@ -27,4 +34,10 @@ enum {
+ 	TKIP_DECRYPT_REPLAY = -3,
+ };
++#ifdef CONFIG_MAC80211_NO_LEGACY_CIPHERS
++static inline int ieee80211_tkip_decrypt_data(struct crypto_cipher *tfm, struct ieee80211_key *key,
++					      u8 *payload, size_t payload_len, u8 *ta, u8 *ra, int only_iv,
++					      int queue, u32 *out_iv32, u16 *out_iv16)
++{ return TKIP_DECRYPT_NO_EXT_IV; }
++#else
+ int ieee80211_tkip_decrypt_data(struct crypto_cipher *tfm,
+ 				struct ieee80211_key *key,
+@@ -32,4 +45,5 @@ int ieee80211_tkip_decrypt_data(struct crypto_cipher *tfm,
+ 				u8 *ra, int only_iv, int queue,
+ 				u32 *out_iv32, u16 *out_iv16);
++#endif
+ 
+ #endif /* TKIP_H */
+diff --git a/net/mac80211/wep.h b/net/mac80211/wep.h
+index 9615749d..caf58823 100644
+--- a/net/mac80211/wep.h
++++ b/net/mac80211/wep.h
+@@ -17,4 +17,19 @@
+ #include "key.h"
+ 
++#ifdef CONFIG_MAC80211_NO_LEGACY_CIPHERS
++static inline int ieee80211_wep_init(struct ieee80211_local *local)
++{
++	local->wep_tx_tfm = ERR_PTR(-EINVAL);
++	local->wep_rx_tfm = ERR_PTR(-EINVAL);
++	return 0;
++}
++static inline void ieee80211_wep_free(struct ieee80211_local *local) {}
++static inline int ieee80211_wep_encrypt(struct ieee80211_local *local, struct sk_buff *skb,
++					const u8 *key, int keylen, int keyidx) { return -1; }
++static inline ieee80211_rx_result ieee80211_crypto_wep_decrypt(struct ieee80211_rx_data *rx)
++{ return RX_DROP_UNUSABLE; }
++static inline ieee80211_tx_result ieee80211_crypto_wep_encrypt(struct ieee80211_tx_data *tx)
++{ return TX_DROP; }
++#else
+ int ieee80211_wep_init(struct ieee80211_local *local);
+ void ieee80211_wep_free(struct ieee80211_local *local);
+@@ -31,4 +46,5 @@ ieee80211_crypto_wep_decrypt(struct ieee80211_rx_data *rx);
+ ieee80211_tx_result
+ ieee80211_crypto_wep_encrypt(struct ieee80211_tx_data *tx);
++#endif
+ 
+ #endif /* WEP_H */

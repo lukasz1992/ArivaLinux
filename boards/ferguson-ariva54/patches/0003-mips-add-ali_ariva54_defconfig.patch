@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:53:30 +0100
+Subject: [PATCH] mips: add ali_ariva54_defconfig
+
+Defconfig for the Ferguson Ariva 54: no-MMU build, FDPIC userland, built-in
+drivers, initramfs from the SDK rootfs.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/configs/ali_ariva54_defconfig | 130 ++++++++++++++++++++++++
+ 1 file changed, 130 insertions(+)
+ create mode 100644 arch/mips/configs/ali_ariva54_defconfig
+
+diff --git a/arch/mips/configs/ali_ariva54_defconfig b/arch/mips/configs/ali_ariva54_defconfig
+new file mode 100644
+index 00000000..129aa8d1
+--- /dev/null
++++ b/arch/mips/configs/ali_ariva54_defconfig
+@@ -0,0 +1,130 @@
++# ALi C3503D (Ferguson Ariva 54) - minimal bring-up config.
++# Fragment over Kconfig defaults; keep trimming it down with
++# `make ARCH=mips savedefconfig` as the port grows.
++CONFIG_MIPS_ALI_C3503D=y
++CONFIG_ALI_BOARD_ARIVA54=y
++CONFIG_CPU_MIPS32_R1=y
++CONFIG_CPU_LITTLE_ENDIAN=y
++CONFIG_SMP=n
++CONFIG_CMDLINE_BOOL=y
++CONFIG_CMDLINE="console=ttyS0,115200e8 nowait"
++# EXPERT unhides the prompts of VT/VGA_CONSOLE; without it their
++# "default y" wins and the dummy VT console grabs the console before
++# ttyS0 exists, silencing the boot log.
++CONFIG_EXPERT=y
++CONFIG_SERIAL_8250=y
++CONFIG_SERIAL_8250_CONSOLE=y
++# VT console would grab the console before ttyS0 and hide the boot log
++# (dummy "80x25" console); UART0 is the only display on this SoC.
++# CONFIG_VT is not set
++# CONFIG_VGA_CONSOLE is not set
++
++# Built-in initramfs: /init (busybox sh) + hello, see the list file.
++CONFIG_BLK_DEV_INITRD=y
++CONFIG_INITRAMFS_SOURCE="arch/mips/ali-c3503d/initramfs.list arch/mips/ali-c3503d/rootfs/"
++CONFIG_INITRAMFS_ROOT_UID=0
++CONFIG_INITRAMFS_ROOT_GID=0
++
++# Networking (kernel side only for now): r8152 and the wireless stack
++# for the rt5370 stick need the core; INET for future userland.
++CONFIG_NET=y
++CONFIG_INET=y
++CONFIG_UNIX=y
++CONFIG_NETDEVICES=y
++CONFIG_ETHERNET=y
++# Wireless: STA client only -- no AP/ad-hoc/mesh, no WEXT compat, no
++# debugfs; rates via Minstrel, the world regulatory database built in
++# (there is no CRDA on this box) and power save off.
++CONFIG_WLAN=y
++CONFIG_WIRELESS=y
++CONFIG_CFG80211=y
++# CONFIG_CFG80211_DEFAULT_PS is not set
++# CONFIG_CFG80211_DEBUGFS is not set
++# CONFIG_CFG80211_WEXT is not set
++CONFIG_MAC80211=y
++# CONFIG_MAC80211_MESH is not set
++# CONFIG_MAC80211_DEBUGFS is not set
++
++# devtmpfs: /dev/sda1 and friends appear by themselves once /init mounts
++# devtmpfs over /dev (no dynamic dev manager on this box).
++CONFIG_DEVTMPFS=y
++# FD650K front panel (drivers/auxdisplay/fd650.c): display + brightness
++# in sysfs, the 8 keys as a polled input device, the two board LEDs
++# through the LED class.
++CONFIG_INPUT=y
++# CONFIG_INPUT_MOUSEDEV is not set
++CONFIG_NEW_LEDS=y
++CONFIG_LEDS_CLASS=y
++CONFIG_AUXDISPLAY=y
++CONFIG_FD650=y
++# gpiolib: the FD650K front panel (GPIO 23/24) and future pins.
++CONFIG_GPIOLIB=y
++# watchdog (the firmware's reboot dog at 0xB8018500), RTC (0xB8018A00)
++# and the SCB i2c masters (0xB8018200/0xB8018700).
++CONFIG_WATCHDOG=y
++CONFIG_WATCHDOG_CORE=y
++CONFIG_RTC_CLASS=y
++CONFIG_RTC_HCTOSYS=y
++CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
++CONFIG_I2C=y
++CONFIG_I2C_GPIO=y
++
++# USB: EHCI 2.0 host on the SoC (0x1803A100, INTC bit 36 -> IRQ 44),
++# OHCI (1.x companion) driver kept in; usb-storage and FAT for sticks,
++# RTL8152B Ethernet, rt5370 (rt2800usb) WiFi.  No HID.
++CONFIG_USB=y
++# CONFIG_USB_HID is not set
++CONFIG_MII=y
++# CONFIG_USB_RTL8152 is not set
++CONFIG_RT2X00=y
++CONFIG_RT2800USB=y
++CONFIG_RT2800USB_RT53XX=y
++# rtl8xxxu (rtl8192cu/8723a) and rt2800usb request firmware at probe;
++# it is embedded in the kernel image (no filesystem dependency).
++CONFIG_EXTRA_FIRMWARE="rtlwifi/rtl8723aufw_A.bin rtlwifi/rtl8723aufw_B.bin rtlwifi/rtl8723aufw_B_NoBT.bin rtlwifi/rtl8192cufw_A.bin rtlwifi/rtl8192cufw_B.bin rtlwifi/rtl8192cufw_TMSC.bin rt2870.bin"
++CONFIG_EXTRA_FIRMWARE_DIR="firmware"
++CONFIG_USB_EHCI_HCD=y
++CONFIG_USB_EHCI_HCD_PLATFORM=y
++CONFIG_USB_OHCI_HCD=y
++CONFIG_USB_OHCI_HCD_PLATFORM=y
++# SCSI must be built-in (=y): left to defaults it degrades to a module
++# (scsi_mod) and demotes USB_STORAGE with it.
++CONFIG_SCSI=y
++CONFIG_BLK_DEV_SD=y
++CONFIG_USB_STORAGE=y
++CONFIG_MSDOS_FS=y
++CONFIG_VFAT_FS=y
++CONFIG_FAT_DEFAULT_CODEPAGE=437
++CONFIG_FAT_DEFAULT_IOCHARSET="utf8"
++CONFIG_NLS=y
++CONFIG_NLS_CODEPAGE_437=y
++CONFIG_NLS_UTF8=y
++
++# flash: SPI NOR through the SF controller (drivers/mtd/devices/ali-sflash.c), /dev/mtdN per partition
++CONFIG_MTD=y
++CONFIG_MTD_CHAR=y
++CONFIG_MTD_BLOCK=y
++CONFIG_MTD_ALI_SFLASH=y
++
++# framebuffer: GMA layer 0 (OSD)
++CONFIG_FB=y
++CONFIG_FB_ALI_GMA=y
++# pilot IR (M6303) przez rc-core, dekoder NEC
++CONFIG_MEDIA_SUPPORT=y
++CONFIG_MEDIA_RC_SUPPORT=y
++CONFIG_RC_CORE=y
++CONFIG_RC_DECODERS=y
++CONFIG_IR_NEC_DECODER=y
++CONFIG_INPUT_EVDEV=y
++# CONFIG_IR_RC5_DECODER is not set
++# CONFIG_IR_RC6_DECODER is not set
++# CONFIG_IR_JVC_DECODER is not set
++# CONFIG_IR_SONY_DECODER is not set
++# CONFIG_IR_SANYO_DECODER is not set
++# CONFIG_IR_SHARP_DECODER is not set
++# CONFIG_IR_MCE_KBD_DECODER is not set
++# CONFIG_IR_XMP_DECODER is not set
++# CONFIG_IR_LIRC_CODEC is not set
++CONFIG_RC_MAP=y
++CONFIG_RC_DEVICES=y
++CONFIG_IR_ALI=y

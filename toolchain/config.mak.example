@@ -1,0 +1,25 @@
+# mipsel MIPS32r1 soft-float, no-FPU 4Kc target — NEW toolchain attempt (GCC 16.2.0, binutils 2.47)
+TARGET = mipsel-linux-musl
+OUTPUT = /nonexistent   # replaced by scripts/10-toolchain.sh (= $MUSL_TC)
+
+GCC_VER = 16.2.0
+BINUTILS_VER = 2.47
+MUSL_VER = 1.2.6
+
+# use curl in case wget lacks proxy support
+DL_CMD = curl -C - -L -o
+
+# single multilib only
+COMMON_CONFIG += --disable-multilib --disable-nls --disable-werror
+
+# C only: the userland (busybox, networkd) is C; building libstdc++ roughly doubles the GCC build time
+GCC_CONFIG += --enable-languages=c
+
+# HOST-side tuning only (x86_64 host tools: binutils, gcc, gmp/mpc/mpfr).
+# Does NOT reach musl (FULL_MUSL_CONFIG has no COMMON_CONFIG) nor target libs
+# (libgcc/libstdc++ use CFLAGS_FOR_TARGET). Target stays mips32/soft-float.
+COMMON_CONFIG += CFLAGS='-O2 -march=native -mtune=native'
+COMMON_CONFIG += CXXFLAGS='-O2 -march=native -mtune=native'
+
+GCC_CONFIG += --with-arch=mips32 --with-float=soft --disable-multilib --enable-default-pie
+GCC_CONFIG += --disable-libquadmath --disable-decimal-float --disable-libitm --disable-fixed-point

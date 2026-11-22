@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:46:03 +0100
+Subject: [PATCH] mips: ali-c3503d: OTP fuses (read-only sysfs file)
+
+Reads the one-time-programmable block at 0x18042000 through its address,
+control and data registers; the program trigger is never set.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/ali-c3503d/Makefile |   2 +-
+ arch/mips/ali-c3503d/otp.c    | 121 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 122 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/ali-c3503d/otp.c
+
+diff --git a/arch/mips/ali-c3503d/Makefile b/arch/mips/ali-c3503d/Makefile
+index b8cb53d9..a0e8eb69 100644
+--- a/arch/mips/ali-c3503d/Makefile
++++ b/arch/mips/ali-c3503d/Makefile
+@@ -3,3 +3,3 @@
+ #
+ 
+-obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc.o i2c-scb.o
++obj-y := setup.o irq.o dev-usb.o dev-flash.o dev-gma.o dev-ir.o gpio.o wdt.o rtc.o i2c-scb.o otp.o
+diff --git a/arch/mips/ali-c3503d/otp.c b/arch/mips/ali-c3503d/otp.c
+new file mode 100644
+index 00000000..751d6d2d
+--- /dev/null
++++ b/arch/mips/ali-c3503d/otp.c
+@@ -0,0 +1,121 @@
++/*
++ * ALi C3503D OTP (M37-style block at 0x18042000, 1 KB), read-only.
++ *
++ * /sys/devices/platform/ali-otp/otp: the 1 KB as a binary file (root only).
++ * Read of one word: wait ST bit 8 clear, ADDR = byte offset, CTRL |= 0x100,
++ * wait ST bit 8 clear, RDATA (PDK aliotp/otp_m37.c, A54 0x805c1958).
++ * Programming is one-way and deliberately not implemented.
++ *
++ * Licensed under the GPLv2.
++ */
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/sysfs.h>
++
++#include "ali.h"
++
++#define OTP_ADDR	0x04
++#define OTP_CTRL	0x0c
++#define OTP_ST		0x10
++#define OTP_RDATA	0x18
++#define OTP_READ_BUSY	BIT(8)
++#define OTP_PROG_TRIG	BIT(0)		/* PDK otp_m37.c: starts a PROGRAM -- never leave it set */
++#define OTP_SIZE	0x400
++
++struct ali_otp {
++	void __iomem *base;
++	struct mutex lock;
++};
++
++static int ali_otp_wait(struct ali_otp *otp)
++{
++	int i;
++
++	for (i = 0; i < 10000; i++) {
++		if (!(readl(otp->base + OTP_ST) & OTP_READ_BUSY))
++			return 0;
++		udelay(1);
++	}
++	return -ETIMEDOUT;
++}
++
++static int ali_otp_word(struct ali_otp *otp, u32 off, u32 *val)
++{
++	int ret = ali_otp_wait(otp);
++
++	if (ret)
++		return ret;
++	writel(off & 0x3ff, otp->base + OTP_ADDR);
++	writel((readl(otp->base + OTP_CTRL) & ~OTP_PROG_TRIG) | OTP_READ_BUSY, otp->base + OTP_CTRL);
++	ret = ali_otp_wait(otp);
++	if (!ret)
++		*val = readl(otp->base + OTP_RDATA);
++	return ret;
++}
++
++static ssize_t otp_read(struct file *f, struct kobject *kobj, struct bin_attribute *a,
++			char *buf, loff_t pos, size_t count)
++{
++	struct ali_otp *otp = dev_get_drvdata(kobj_to_dev(kobj));
++	size_t done = 0;
++	int ret = 0;
++
++	mutex_lock(&otp->lock);
++	while (done < count) {
++		u32 w, o = (pos + done) & ~3;
++		size_t skip = (pos + done) & 3, n = min_t(size_t, 4 - skip, count - done);
++
++		ret = ali_otp_word(otp, o, &w);
++		if (ret)
++			break;
++		memcpy(buf + done, (u8 *)&w + skip, n);
++		done += n;
++	}
++	mutex_unlock(&otp->lock);
++	return done ? done : ret;
++}
++
++static BIN_ATTR(otp, 0400, otp_read, NULL, OTP_SIZE);
++
++static int ali_otp_probe(struct platform_device *pdev)
++{
++	struct ali_otp *otp;
++	struct resource *res;
++
++	otp = devm_kzalloc(&pdev->dev, sizeof(*otp), GFP_KERNEL);
++	if (!otp)
++		return -ENOMEM;
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	otp->base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(otp->base))
++		return PTR_ERR(otp->base);
++	mutex_init(&otp->lock);
++	platform_set_drvdata(pdev, otp);
++	return sysfs_create_bin_file(&pdev->dev.kobj, &bin_attr_otp);
++}
++
++static int ali_otp_remove(struct platform_device *pdev)
++{
++	sysfs_remove_bin_file(&pdev->dev.kobj, &bin_attr_otp);
++	return 0;
++}
++
++static struct platform_driver ali_otp_driver = {
++	.probe	= ali_otp_probe,
++	.remove	= ali_otp_remove,
++	.driver	= { .name = "ali-otp" },
++};
++module_platform_driver(ali_otp_driver);
++MODULE_LICENSE("GPL");
++
++static int __init ali_otp_add(void)
++{
++	const struct resource otp = DEFINE_RES_MEM(0x18042000UL, 0x40);
++
++	ali_add("ali-otp", -1, &otp, 1);	/* read-only, sysfs "otp" */
++	return 0;
++}
++arch_initcall(ali_otp_add);

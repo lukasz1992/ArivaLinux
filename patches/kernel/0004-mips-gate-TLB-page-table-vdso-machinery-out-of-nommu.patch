@@ -1,0 +1,696 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Tue, 17 Nov 2026 17:40:53 +0100
+Subject: [PATCH] mips: gate TLB/page-table/vdso machinery out of nommu
+ build: P3
+
+Build gating (docs/nommu_mipsel_implementation.md, patch P3):
+
+arch/mips/mm/Makefile:
+- fault.o gup.o mmap.o tlbex.o tlbex-fault.o tlb-funcs.o and
+  pgtable-{32,64}.o only under CONFIG_MMU (conditional vars -- names
+  must not match the .o basenames or Kbuild treats them as composite
+  parts and builds nothing).
+- ioremap.o MMU-only; new ioremap-nommu.c provides __ioremap/__iounmap
+  over the fixed kseg1 window (low 512MB uncached), rejecting anything
+  else -- there are no page tables to remap into.
+- tlb-r4k.o split out of the cache lines (c-r4k.o cex-gen.o must stay:
+  the C3503D needs R4K cache maintenance) via mmu-tlb-y.
+- uasm stays unconditional: arch/mips/mm/page.c uses it to build
+  clear_page/copy_page.
+
+arch/mips/kernel: vdso.o MMU-only; GENERIC_TIME_VSYSCALL is selected only
+with MMU, so timekeeping needs no update_vsyscall() hooks.
+arch/mips/Kbuild: vdso/ MMU-only.  Kconfig: CPU_GENERIC_DUMP_TLB
+depends on MMU (no TLB to dump).
+
+Source ifdefs:
+- traps.c: handle_tlb* vector installs (1..3), tlb_do_page_fault_0
+  (RIXI ex. 19/20), tlb_init()/TLBMISS_HANDLER_SETUP(),
+  TLBMISS_HANDLER_RESTORE() in the PM notifier, ASID_FIRST_VERSION and
+  the dump_tlb block in do_mcheck.
+- mm/init.c: pagetable_init()/kmap_init() in paging_init (zones only
+  for nommu), the wired-TLB kmap card (__kmap_pgprot and friends)
+  replaced by kseg0 stubs (cpu_has_dc_aliases == 0 makes them dead),
+  fixrange_init users gone, swapper_pg_dir/invalid_*_table/pgd_current
+  MMU-only, plus nommu definitions of shm_align_mask,
+  show_unhandled_signals and __virt_addr_valid (moved out of mmap.c/
+  fault.c).
+- mm/cache.c: __update_cache()/setup_protection_map() MMU-only.
+- mm/c-r4k.c: has_valid_asid and the page-table-walking flush_cache_
+  {mm,range,page} implementations MMU-only, with no-op nommu versions
+  so the cache_ops wiring still links.
+- signal.c: nommu sigreturn trampolines in kernel text (userland runs
+  in kernel mode, no vdso to borrow): li v0,__NR{,_rt}_sigreturn;
+  syscall -- verified in disassembly (4119/4193).  abi->vdso
+  initializers gated in signal.c/signal32.c/signal_n32.c.
+- asm/elf.h: ARCH_DLINFO (AT_SYSINFO_EHDR) and
+  ARCH_HAS_SETUP_ADDITIONAL_PAGES MMU-only; binfmt_elf.c tolerates an
+  absent ARCH_DLINFO (#ifdef).
+
+Nommu vmlinux links; System.map contains zero TLB/vdso symbols.
+Regression (malta, MMU=y): full vmlinux builds, TLB/vdso symbols
+back.  Only warnings left are pre-existing GCC14 -fcommon COMMON-symbol
+modpost noise and kernel/sched/core.c -Waddress (both also on the
+pristine tree).
+---
+ arch/mips/Kbuild                   |  2 +-
+ arch/mips/Kconfig                  |  3 +-
+ arch/mips/include/asm/cacheflush.h | 15 ++++++++
+ arch/mips/include/asm/elf.h        |  2 ++
+ arch/mips/include/asm/mmu.h        | 10 ++++--
+ arch/mips/include/asm/pgtable_no.h |  6 ++++
+ arch/mips/kernel/Makefile          |  5 +--
+ arch/mips/kernel/mips_ksyms.c      |  4 +++
+ arch/mips/kernel/signal.c          | 40 +++++++++++++++++++++-
+ arch/mips/kernel/signal32.c        |  3 +-
+ arch/mips/kernel/signal_n32.c      |  3 +-
+ arch/mips/kernel/traps.c           | 21 +++++++++++-
+ arch/mips/mm/Makefile              | 29 +++++++++++-----
+ arch/mips/mm/c-r4k.c               | 25 ++++++++++++++
+ arch/mips/mm/cache.c               |  6 ++++
+ arch/mips/mm/init.c                | 45 ++++++++++++++++++++++++
+ arch/mips/mm/ioremap-nommu.c       | 55 ++++++++++++++++++++++++++++++
+ 17 files changed, 256 insertions(+), 18 deletions(-)
+ create mode 100644 arch/mips/mm/ioremap-nommu.c
+
+diff --git a/arch/mips/Kbuild b/arch/mips/Kbuild
+index 5c3f688a..f360efba 100644
+--- a/arch/mips/Kbuild
++++ b/arch/mips/Kbuild
+@@ -18,5 +18,5 @@ obj-y += kernel/
+ obj-y += mm/
+ obj-y += net/
+-obj-y += vdso/
++obj-$(CONFIG_MMU) += vdso/
+ 
+ ifdef CONFIG_KVM
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index fbca3f97..59b39994 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -64,5 +64,5 @@ config MIPS
+ 	select HAVE_VIRT_CPU_ACCOUNTING_GEN
+ 	select HAVE_IRQ_TIME_ACCOUNTING
+-	select GENERIC_TIME_VSYSCALL
++	select GENERIC_TIME_VSYSCALL if MMU
+ 	select ARCH_CLOCKSOURCE_DATA
+ 
+@@ -2148,4 +2148,5 @@ config CPU_GENERIC_DUMP_TLB
+ 	bool
+ 	default y if !(CPU_R3000 || CPU_R6000 || CPU_R8000 || CPU_TX39XX)
++	depends on MMU
+ 
+ config CPU_R4K_FPU
+diff --git a/arch/mips/include/asm/cacheflush.h b/arch/mips/include/asm/cacheflush.h
+index 176de586..277ee7c3 100644
+--- a/arch/mips/include/asm/cacheflush.h
++++ b/arch/mips/include/asm/cacheflush.h
+@@ -98,4 +98,5 @@ static inline void flush_cache_vunmap(unsigned long start, unsigned long end)
+ }
+ 
++#ifdef CONFIG_MMU
+ extern void copy_to_user_page(struct vm_area_struct *vma,
+ 	struct page *page, unsigned long vaddr, void *dst, const void *src,
+@@ -105,4 +106,18 @@ extern void copy_from_user_page(struct vm_area_struct *vma,
+ 	struct page *page, unsigned long vaddr, void *dst, const void *src,
+ 	unsigned long len);
++#else
++/*
++ * No MMU: user addresses are the kernel's own, there is no aliasing through a user mapping, and mm/nommu.c passes
++ * page == NULL here.  The MMU version dereferences that page (page_mapped(NULL)): on the ALi C3503D that reads
++ * from KUSEG, which is not backed by anything, and hangs the bus (cat /proc/<pid>/cmdline, ps).
++ */
++#define copy_to_user_page(vma, page, vaddr, dst, src, len)			\
++do {										\
++	memcpy((dst), (src), (len));						\
++	flush_icache_range((unsigned long)(dst), (unsigned long)(dst) + (len));	\
++} while (0)
++#define copy_from_user_page(vma, page, vaddr, dst, src, len)			\
++	memcpy((dst), (src), (len))
++#endif
+ 
+ extern void (*flush_cache_sigtramp)(unsigned long addr);
+diff --git a/arch/mips/include/asm/elf.h b/arch/mips/include/asm/elf.h
+index ce985cef..5ad05a14 100644
+--- a/arch/mips/include/asm/elf.h
++++ b/arch/mips/include/asm/elf.h
+@@ -422,4 +422,5 @@ extern const char *__elf_platform;
+ 
+ /* update AT_VECTOR_SIZE_ARCH if the number of NEW_AUX_ENT entries changes */
++#ifdef CONFIG_MMU
+ #define ARCH_DLINFO							\
+ do {									\
+@@ -432,4 +433,5 @@ struct linux_binprm;
+ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 				       int uses_interp);
++#endif /* CONFIG_MMU */
+ 
+ struct arch_elf_state {
+diff --git a/arch/mips/include/asm/mmu.h b/arch/mips/include/asm/mmu.h
+index e04d5711..df6fadc4 100644
+--- a/arch/mips/include/asm/mmu.h
++++ b/arch/mips/include/asm/mmu.h
+@@ -16,7 +16,13 @@ typedef struct {
+ /*
+  * No-MMU (fixed mapping) core: no ASID to save and no vdso; keep
+- * end_brk for sys_brk() in mm/nommu.c (asm-generic/mmu.h).
++ * end_brk for sys_brk() in mm/nommu.c.  fp_mode_switching is shared
++ * with the MMU header: prctl(PR_SET_FP_MODE) still touches it.
+  */
+-#include <asm-generic/mmu.h>
++#include <linux/atomic.h>
++
++typedef struct {
++	unsigned long end_brk;
++	atomic_t fp_mode_switching;
++} mm_context_t;
+ 
+ #endif /* CONFIG_MMU */
+diff --git a/arch/mips/include/asm/pgtable_no.h b/arch/mips/include/asm/pgtable_no.h
+index f43ab3aa..0c84cff7 100644
+--- a/arch/mips/include/asm/pgtable_no.h
++++ b/arch/mips/include/asm/pgtable_no.h
+@@ -20,4 +20,10 @@
+ #include <asm/page.h>
+ 
++/*
++ * Declared in the MMU header (pgtable-bits.h consumers); c-r4k.c sets
++ * it at probe time in both configurations.
++ */
++extern unsigned long _page_cachable_default;
++
+ /*
+  * pud_* is folded onto pgd_* (4-level fixup); pmd_t exists only so
+diff --git a/arch/mips/kernel/Makefile b/arch/mips/kernel/Makefile
+index 68e2b7db..f831bef2 100644
+--- a/arch/mips/kernel/Makefile
++++ b/arch/mips/kernel/Makefile
+@@ -7,6 +7,7 @@ extra-y		:= head.o vmlinux.lds
+ obj-y		+= cpu-probe.o branch.o elf.o entry.o genex.o idle.o irq.o \
+ 		   process.o prom.o ptrace.o reset.o setup.o signal.o \
+-		   syscall.o time.o topology.o traps.o unaligned.o watch.o \
+-		   vdso.o
++		   syscall.o time.o topology.o traps.o unaligned.o watch.o
++
++obj-$(CONFIG_MMU)	+= vdso.o
+ 
+ ifdef CONFIG_FUNCTION_TRACER
+diff --git a/arch/mips/kernel/mips_ksyms.c b/arch/mips/kernel/mips_ksyms.c
+index e2b6ab74..c6d81bfa 100644
+--- a/arch/mips/kernel/mips_ksyms.c
++++ b/arch/mips/kernel/mips_ksyms.c
+@@ -59,6 +59,8 @@ EXPORT_SYMBOL(copy_page);
+  * Userspace access stuff.
+  */
++#ifdef CONFIG_MMU
+ EXPORT_SYMBOL(__copy_user);
+ EXPORT_SYMBOL(__copy_user_inatomic);
++#endif
+ #ifdef CONFIG_EVA
+ EXPORT_SYMBOL(__copy_from_user_eva);
+@@ -88,5 +90,7 @@ EXPORT_SYMBOL(__csum_partial_copy_from_user);
+ #endif
+ 
++#ifdef CONFIG_MMU
+ EXPORT_SYMBOL(invalid_pte_table);
++#endif
+ #ifdef CONFIG_FUNCTION_TRACER
+ /* _mcount is defined in arch/mips/kernel/mcount.S */
+diff --git a/arch/mips/kernel/signal.c b/arch/mips/kernel/signal.c
+index 9e35b6b2..73592835 100644
+--- a/arch/mips/kernel/signal.c
++++ b/arch/mips/kernel/signal.c
+@@ -43,4 +43,31 @@
+ #include "signal-common.h"
+ 
++#ifdef CONFIG_MIPS_NOMMU
++#include <linux/stringify.h>
++/*
++ * No vdso on nommu: userland runs in kernel mode, so the sigreturn
++ * trampoline can simply live in kernel text.  Both the rt and the
++ * trad (o32) stubs are provided; musl only ever takes the rt path.
++ */
++extern void __nommu_sigreturn(void);
++extern void __nommu_rt_sigreturn(void);
++
++asm(
++"	.text\n"
++"	.globl	__nommu_sigreturn\n"
++"	.type	__nommu_sigreturn, @function\n"
++"__nommu_sigreturn:\n"
++"	li	$2, " __stringify(__NR_sigreturn) "\n"
++"	syscall\n"
++"	break	0\n"		/* sigreturn does not return; do not fall into the next stub */
++"	.globl	__nommu_rt_sigreturn\n"
++"	.type	__nommu_rt_sigreturn, @function\n"
++"__nommu_rt_sigreturn:\n"
++"	li	$2, " __stringify(__NR_rt_sigreturn) "\n"
++"	syscall\n"
++"	break	0\n"
++);
++#endif
++
+ static int (*save_fp_context)(void __user *sc);
+ static int (*restore_fp_context)(void __user *sc);
+@@ -762,6 +789,7 @@ struct mips_abi mips_abi = {
+ 	.off_sc_fpc_csr = offsetof(struct sigcontext, sc_fpc_csr),
+ 	.off_sc_used_math = offsetof(struct sigcontext, sc_used_math),
+-
++#ifdef CONFIG_MMU
+ 	.vdso		= &vdso_image,
++#endif
+ };
+ 
+@@ -771,5 +799,7 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ 	int ret;
+ 	struct mips_abi *abi = current->thread.abi;
++#ifdef CONFIG_MMU
+ 	void *vdso = current->mm->context.vdso;
++#endif
+ 
+ 	if (regs->regs[0]) {
+@@ -795,4 +825,5 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ 
+ 	if (sig_uses_siginfo(&ksig->ka))
++#ifdef CONFIG_MMU
+ 		ret = abi->setup_rt_frame(vdso + abi->vdso->off_rt_sigreturn,
+ 					  ksig, regs, oldset);
+@@ -800,4 +831,11 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ 		ret = abi->setup_frame(vdso + abi->vdso->off_sigreturn,
+ 				       ksig, regs, oldset);
++#else
++		ret = abi->setup_rt_frame((void *)__nommu_rt_sigreturn,
++					  ksig, regs, oldset);
++	else
++		ret = abi->setup_frame((void *)__nommu_sigreturn,
++				       ksig, regs, oldset);
++#endif
+ 
+ 	signal_setup_done(ret, ksig, 0);
+diff --git a/arch/mips/kernel/signal32.c b/arch/mips/kernel/signal32.c
+index 4909639a..df6c84e5 100644
+--- a/arch/mips/kernel/signal32.c
++++ b/arch/mips/kernel/signal32.c
+@@ -412,5 +412,6 @@ struct mips_abi mips_abi_32 = {
+ 	.off_sc_fpc_csr = offsetof(struct sigcontext32, sc_fpc_csr),
+ 	.off_sc_used_math = offsetof(struct sigcontext32, sc_used_math),
+-
++#ifdef CONFIG_MMU
+ 	.vdso		= &vdso_image_o32,
++#endif
+ };
+diff --git a/arch/mips/kernel/signal_n32.c b/arch/mips/kernel/signal_n32.c
+index a7bc3843..be51ac84 100644
+--- a/arch/mips/kernel/signal_n32.c
++++ b/arch/mips/kernel/signal_n32.c
+@@ -156,5 +156,6 @@ struct mips_abi mips_abi_n32 = {
+ 	.off_sc_fpc_csr = offsetof(struct sigcontext, sc_fpc_csr),
+ 	.off_sc_used_math = offsetof(struct sigcontext, sc_used_math),
+-
++#ifdef CONFIG_MMU
+ 	.vdso		= &vdso_image_n32,
++#endif
+ };
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index 04d3395d..7076bdb0 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -69,7 +69,9 @@ extern void check_wait(void);
+ extern asmlinkage void rollback_handle_int(void);
+ extern asmlinkage void handle_int(void);
++#ifdef CONFIG_MMU
+ extern u32 handle_tlbl[];
+ extern u32 handle_tlbs[];
+ extern u32 handle_tlbm[];
++#endif
+ extern asmlinkage void handle_adel(void);
+ extern asmlinkage void handle_ades(void);
+@@ -94,5 +96,7 @@ extern asmlinkage void handle_dsp(void);
+ extern asmlinkage void handle_mcheck(void);
+ extern asmlinkage void handle_reserved(void);
++#ifdef CONFIG_MMU
+ extern void tlb_do_page_fault_0(void);
++#endif
+ 
+ void (*board_be_init)(void);
+@@ -1553,7 +1557,9 @@ asmlinkage void do_mcheck(struct pt_regs *regs)
+ 
+ 	if (multi_match) {
++#ifdef CONFIG_MMU
+ 		dump_tlb_regs();
+ 		pr_info("\n");
+ 		dump_tlb_all();
++#endif
+ 	}
+ 
+@@ -2029,6 +2035,7 @@ void *set_vi_handler(int n, vi_handler_t addr)
+ }
+ 
++#ifdef CONFIG_MMU
+ extern void tlb_init(void);
+-
++#endif
+ /*
+  * Timer interrupt
+@@ -2120,5 +2127,7 @@ static void configure_exception_vector(void)
+ void per_cpu_trap_init(bool is_boot_cpu)
+ {
++#ifdef CONFIG_MMU
+ 	unsigned int cpu = smp_processor_id();
++#endif
+ 
+ 	configure_status();
+@@ -2149,6 +2158,8 @@ void per_cpu_trap_init(bool is_boot_cpu)
+ 	}
+ 
++#ifdef CONFIG_MMU
+ 	if (!cpu_data[cpu].asid_cache)
+ 		cpu_data[cpu].asid_cache = ASID_FIRST_VERSION;
++#endif
+ 
+ 	atomic_inc(&init_mm.mm_count);
+@@ -2160,6 +2171,8 @@ void per_cpu_trap_init(bool is_boot_cpu)
+ 	if (!is_boot_cpu)
+ 		cpu_cache_init();
++#ifdef CONFIG_MMU
+ 	tlb_init();
+ 	TLBMISS_HANDLER_SETUP();
++#endif
+ }
+ 
+@@ -2289,7 +2302,9 @@ void __init trap_init(void)
+ 	set_except_vector(0, using_rollback_handler() ? rollback_handle_int
+ 						      : handle_int);
++#ifdef CONFIG_MMU
+ 	set_except_vector(1, handle_tlbm);
+ 	set_except_vector(2, handle_tlbl);
+ 	set_except_vector(3, handle_tlbs);
++#endif
+ 
+ 	set_except_vector(4, handle_adel);
+@@ -2332,8 +2347,10 @@ void __init trap_init(void)
+ 	set_except_vector(16, handle_ftlb);
+ 
++#ifdef CONFIG_MMU
+ 	if (cpu_has_rixiex) {
+ 		set_except_vector(19, tlb_do_page_fault_0);
+ 		set_except_vector(20, tlb_do_page_fault_0);
+ 	}
++#endif
+ 
+ 	set_except_vector(21, handle_msa);
+@@ -2377,5 +2394,7 @@ static int trap_pm_notifier(struct notifier_block *self, unsigned long cmd,
+ 
+ 		/* Restore register with CPU number for TLB handlers */
++#ifdef CONFIG_MMU
+ 		TLBMISS_HANDLER_RESTORE();
++#endif
+ 
+ 		break;
+diff --git a/arch/mips/mm/Makefile b/arch/mips/mm/Makefile
+index b4c64bd3..6ced88d9 100644
+--- a/arch/mips/mm/Makefile
++++ b/arch/mips/mm/Makefile
+@@ -3,7 +3,6 @@
+ #
+ 
+-obj-y				+= cache.o dma-default.o extable.o fault.o \
+-				   gup.o init.o mmap.o page.o page-funcs.o \
+-				   tlbex.o tlbex-fault.o tlb-funcs.o
++obj-y				+= cache.o dma-default.o extable.o init.o \
++				   page.o page-funcs.o
+ 
+ ifdef CONFIG_CPU_MICROMIPS
+@@ -13,15 +12,29 @@ obj-y				+= uasm-mips.o
+ endif
+ 
+-obj-$(CONFIG_32BIT)		+= ioremap.o pgtable-32.o
+-obj-$(CONFIG_64BIT)		+= pgtable-64.o
++# Page-table and TLB machinery only exists on MMU builds; the
++# fault/mmap/gup side of the mm comes from mm/nommu.c there.
++# (Variable names deliberately do not match the .o basenames --
++# Kbuild would treat <name>-y as composite-object parts.)
++# As in the original: 32-bit takes pgtable-32.o + ioremap.o, 64-bit pgtable-64.o; the MMU
++# gate is the obj-$(CONFIG_MMU) line.
++mmu-pg-$(CONFIG_32BIT)		:= pgtable-32.o ioremap.o
++mmu-pg-$(CONFIG_64BIT)		:= pgtable-64.o
++obj-$(CONFIG_MMU)		+= fault.o gup.o mmap.o tlbex.o tlbex-fault.o \
++				   tlb-funcs.o $(mmu-pg-y)
++
++obj-$(CONFIG_MIPS_NOMMU)	+= ioremap-nommu.o
+ obj-$(CONFIG_HIGHMEM)		+= highmem.o
+ obj-$(CONFIG_HUGETLB_PAGE)	+= hugetlbpage.o
+ 
+-obj-$(CONFIG_CPU_R4K_CACHE_TLB) += c-r4k.o cex-gen.o tlb-r4k.o
++# TLB helpers exist only on MMU builds (fixed-mapping cores have no TLB
++# to refill); keep the cache files unconditional.
++mmu-tlb-$(CONFIG_MMU)		:= tlb-r4k.o
++
++obj-$(CONFIG_CPU_R4K_CACHE_TLB) += c-r4k.o cex-gen.o $(mmu-tlb-y)
+ obj-$(CONFIG_CPU_R3000)		+= c-r3k.o tlb-r3k.o
+ obj-$(CONFIG_CPU_R8000)		+= c-r4k.o cex-gen.o tlb-r8k.o
+-obj-$(CONFIG_CPU_SB1)		+= c-r4k.o cerr-sb1.o cex-sb1.o tlb-r4k.o
++obj-$(CONFIG_CPU_SB1)		+= c-r4k.o cerr-sb1.o cex-sb1.o $(mmu-tlb-y)
+ obj-$(CONFIG_CPU_TX39XX)	+= c-tx39.o tlb-r3k.o
+-obj-$(CONFIG_CPU_CAVIUM_OCTEON) += c-octeon.o cex-oct.o tlb-r4k.o
++obj-$(CONFIG_CPU_CAVIUM_OCTEON) += c-octeon.o cex-oct.o $(mmu-tlb-y)
+ 
+ obj-$(CONFIG_IP22_CPU_SCACHE)	+= sc-ip22.o
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index 90f8d6d5..a88a6a6c 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -465,4 +465,5 @@ static void r4k___flush_cache_all(void)
+ }
+ 
++#ifdef CONFIG_MMU
+ static inline int has_valid_asid(const struct mm_struct *mm)
+ {
+@@ -479,4 +480,5 @@ static inline int has_valid_asid(const struct mm_struct *mm)
+ #endif
+ }
++#endif /* CONFIG_MMU */
+ 
+ static void r4k__flush_cache_vmap(void)
+@@ -490,4 +492,5 @@ static void r4k__flush_cache_vunmap(void)
+ }
+ 
++#ifdef CONFIG_MMU
+ static inline void local_r4k_flush_cache_range(void * args)
+ {
+@@ -637,4 +640,26 @@ static void r4k_flush_cache_page(struct vm_area_struct *vma,
+ 	r4k_on_each_cpu(local_r4k_flush_cache_page, &args);
+ }
++#else /* !CONFIG_MMU */
++/*
++ * No-MMU: there are no page tables to walk and the fixed-mapping cores
++ * have alias-free caches (cpu_has_dc_aliases == 0), so there is no D-cache
++ * work.  The I-cache is still not coherent: an executable mapping that was
++ * written to (ptrace POKETEXT -> copy_to_user_page(), a loader) must have its
++ * I-cache lines dropped, as the MMU versions do for VM_EXEC.
++ */
++static void r4k_flush_cache_mm(struct mm_struct *mm) { }
++static void r4k_flush_cache_range(struct vm_area_struct *vma,
++	unsigned long start, unsigned long end)
++{
++	if (vma->vm_flags & VM_EXEC)
++		flush_icache_range(start, end);
++}
++static void r4k_flush_cache_page(struct vm_area_struct *vma,
++	unsigned long addr, unsigned long pfn)
++{
++	if (vma->vm_flags & VM_EXEC)
++		flush_icache_range(addr & PAGE_MASK, (addr & PAGE_MASK) + PAGE_SIZE);
++}
++#endif /* CONFIG_MMU */
+ 
+ static inline void local_r4k_flush_data_cache_page(void * addr)
+diff --git a/arch/mips/mm/cache.c b/arch/mips/mm/cache.c
+index e87bccd6..d9f53521 100644
+--- a/arch/mips/mm/cache.c
++++ b/arch/mips/mm/cache.c
+@@ -126,4 +126,5 @@ void __flush_anon_page(struct page *page, unsigned long vmaddr)
+ EXPORT_SYMBOL(__flush_anon_page);
+ 
++#ifdef CONFIG_MMU
+ void __update_cache(unsigned long address, pte_t pte)
+ {
+@@ -151,8 +152,10 @@ void __update_cache(unsigned long address, pte_t pte)
+ 	}
+ }
++#endif /* CONFIG_MMU */
+ 
+ unsigned long _page_cachable_default;
+ EXPORT_SYMBOL(_page_cachable_default);
+ 
++#ifdef CONFIG_MMU
+ static inline void setup_protection_map(void)
+ {
+@@ -195,4 +198,5 @@ static inline void setup_protection_map(void)
+ 	}
+ }
++#endif /* CONFIG_MMU */
+ 
+ void cpu_cache_init(void)
+@@ -230,5 +234,7 @@ void cpu_cache_init(void)
+ 	}
+ 
++#ifdef CONFIG_MMU
+ 	setup_protection_map();
++#endif
+ }
+ 
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+index 8770e619..4bcf80f9 100644
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -58,4 +58,21 @@ EXPORT_SYMBOL_GPL(empty_zero_page);
+ EXPORT_SYMBOL(zero_page_mask);
+ 
++#ifndef CONFIG_MMU
++/*
++ * nommu: globals that the MMU build gets from mmap.c (shm_align_mask,
++ * __virt_addr_valid) and fault.c (show_unhandled_signals), which are
++ * not built here.
++ */
++unsigned long shm_align_mask = PAGE_SIZE - 1;	/* Sane caches */
++EXPORT_SYMBOL(shm_align_mask);
++
++int show_unhandled_signals = 1;
++
++int __virt_addr_valid(const volatile void *kaddr)
++{
++	return pfn_valid(__pa(kaddr) >> PAGE_SHIFT);
++}
++#endif /* CONFIG_MMU */
++
+ /*
+  * Not static inline because used by IP27 special magic initialization code
+@@ -83,4 +100,5 @@ void setup_zero_pages(void)
+ }
+ 
++#ifdef CONFIG_MMU
+ static void *__kmap_pgprot(struct page *page, unsigned long addr, pgprot_t prot)
+ {
+@@ -158,4 +176,25 @@ void kunmap_coherent(void)
+ 	preempt_enable();
+ }
++#else /* !CONFIG_MMU */
++/*
++ * No-MMU: everything the kernel can reach is permanently mapped, and
++ * the fixed-mapping cores (cpu_has_dc_aliases == 0) never have cache
++ * aliases to resolve.  These stubs only exist so that the cache
++ * maintenance code links; they return the page's normal kseg0 mapping.
++ */
++void *kmap_coherent(struct page *page, unsigned long addr)
++{
++	return page_address(page) + (addr & ~PAGE_MASK);
++}
++
++void *kmap_noncoherent(struct page *page, unsigned long addr)
++{
++	return page_address(page) + (addr & ~PAGE_MASK);
++}
++
++void kunmap_coherent(void)
++{
++}
++#endif /* CONFIG_MMU */
+ 
+ void copy_user_highpage(struct page *to, struct page *from,
+@@ -183,4 +222,5 @@ void copy_user_highpage(struct page *to, struct page *from,
+ }
+ 
++#ifdef CONFIG_MMU
+ void copy_to_user_page(struct vm_area_struct *vma,
+ 	struct page *page, unsigned long vaddr, void *dst, const void *src,
+@@ -217,4 +257,5 @@ void copy_from_user_page(struct vm_area_struct *vma,
+ }
+ EXPORT_SYMBOL_GPL(copy_from_user_page);
++#endif /* CONFIG_MMU */
+ 
+ void __init fixrange_init(unsigned long start, unsigned long end,
+@@ -400,4 +441,5 @@ void __init paging_init(void)
+ 	unsigned long lastpfn __maybe_unused;
+ 
++#ifdef CONFIG_MMU
+ 	pagetable_init();
+ 
+@@ -405,4 +447,5 @@ void __init paging_init(void)
+ 	kmap_init();
+ #endif
++#endif
+ #ifdef CONFIG_ZONE_DMA
+ 	max_zone_pfns[ZONE_DMA] = MAX_DMA_PFN;
+@@ -515,4 +558,5 @@ void __init_refok free_initmem(void)
+ }
+ 
++#ifdef CONFIG_MMU
+ #ifndef CONFIG_MIPS_PGD_C0_CONTEXT
+ unsigned long pgd_current[NR_CPUS];
+@@ -535,2 +579,3 @@ pmd_t invalid_pmd_table[PTRS_PER_PMD] __page_aligned_bss;
+ #endif
+ pte_t invalid_pte_table[PTRS_PER_PTE] __page_aligned_bss;
++#endif /* CONFIG_MMU */
+diff --git a/arch/mips/mm/ioremap-nommu.c b/arch/mips/mm/ioremap-nommu.c
+new file mode 100644
+index 00000000..8f483015
+--- /dev/null
++++ b/arch/mips/mm/ioremap-nommu.c
+@@ -0,0 +1,55 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2026 ALiLinux project
++ *
++ * No-MMU ioremap: there are no page tables to remap into, so device
++ * windows are only reachable through the fixed kseg1 mapping, which
++ * covers the low 512 MB of physical address space uncached.  Anything
++ * outside that window (and any request for a cachable mapping) cannot
++ * be served and is rejected.
++ */
++#include <linux/export.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++
++#include <asm/addrspace.h>
++#include <asm/io.h>
++
++#define IS_LOW512(addr)	(!((phys_addr_t)(addr) & (phys_addr_t) ~0x1fffffffULL))
++#define IS_KSEG1(addr)	(((unsigned long)(addr) & ~0x1fffffffUL) == CKSEG1)
++
++void __iomem * __ioremap(phys_addr_t phys_addr, phys_addr_t size,
++	unsigned long flags)
++{
++	phys_addr_t last_addr = phys_addr + size - 1;
++
++	/* Don't allow wraparound or zero size. */
++	if (!size || last_addr < phys_addr)
++		return NULL;
++
++	if (flags != _CACHE_UNCACHED ||
++	    !(IS_LOW512(phys_addr) && IS_LOW512(last_addr))) {
++		WARN_ONCE(1, "ioremap(0x%pa, 0x%pa): no fixed kseg1 window "
++			  "for this address\n", &phys_addr, &last_addr);
++		return NULL;
++	}
++
++	return (void __iomem *) CKSEG1ADDR(phys_addr);
++}
++EXPORT_SYMBOL(__ioremap);
++
++void __iounmap(const volatile void __iomem *addr)
++{
++	/*
++	 * Everything ioremap() hands out here is a fixed kseg1 window,
++	 * nothing to unmap.  The generic iounmap() only calls us when
++	 * the address is not a statically-known kseg1 address; warn on
++	 * anything else.
++	 */
++	if (!IS_KSEG1(addr))
++		WARN_ONCE(1, "iounmap: bad address %p\n", addr);
++}
++EXPORT_SYMBOL(__iounmap);

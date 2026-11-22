@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Tue, 17 Nov 2026 16:42:54 +0100
+Subject: [PATCH] mips: introduce MIPS_NOMMU (CONFIG_MMU=n) skeleton: P1
+
+The C3503D core (4Kc, PRId 0x18055) runs in fixed mapping mode:
+Config0.MT == 3 and Config1.MMU_size == 0 -- there is no TLB, so
+the kernel must build without CONFIG_MMU.
+
+Kconfig:
+- new MIPS_NOMMU symbol (selected by MIPS_ALI_C3503D); MMU becomes
+  def_bool !MIPS_NOMMU, so other platforms are unaffected (malta
+  keeps CONFIG_MMU=y).
+- HUGETLB_PAGE drops out on its own (SYS_SUPPORTS_HUGETLBFS is not
+  selected by the platform).
+
+cpu-probe:
+- decode_config0() learns MIPS_CONF_MT_FMT (MT == 3): leaves
+  MIPS_CPU_TLB unset and zeroes c->tlbsize (decode_config1() skips
+  the tlbsize read when cpu_has_tlb is off).
+
+mach-ali/cpu-feature-overrides.h (new):
+- compile-time cpu_has_tlb/tlbinv/ftlb = 0, no FPU, no 64-bit:
+  only cpu-probe.c reads cpu_has_tlb in 4.4, both users compile out.
+
+Status: ali_c3503d_defconfig -> # CONFIG_MMU is not set; malta keeps
+MMU=y; cpu-probe.o builds in both configurations.  The tree does not
+link yet under !MMU (P2 headers / P3 build gating to follow, see
+docs/nommu_mipsel_implementation.md).
+---
+ arch/mips/Kconfig                             | 11 +++++++-
+ .../asm/mach-ali/cpu-feature-overrides.h      | 26 +++++++++++++++++++
+ arch/mips/include/asm/mipsregs.h              |  1 +
+ arch/mips/kernel/cpu-probe.c                  |  9 +++++++
+ 4 files changed, 46 insertions(+), 1 deletion(-)
+ create mode 100644 arch/mips/include/asm/mach-ali/cpu-feature-overrides.h
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 98312d3e..fbca3f97 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -2914,7 +2914,16 @@ config TC
+ 	  <http://www.linux-mips.org/wiki/DECstation>
+ 
++config MIPS_NOMMU
++	bool
++	help
++	  Selected by platforms whose CPU has no TLB (MIPS32 fixed
++	  mapping, Config0.MT == 3).  It turns the global MMU symbol
++	  off, switching the kernel to the no-MMU (nommu) build: no
++	  page tables, no fork(), binfmt_elf_fdpic loads static-PIE
++	  ELF binaries.  Never set this by hand.
++
+ config MMU
+ 	bool
+-	default y
++	default !MIPS_NOMMU
+ 
+ config I8253
+diff --git a/arch/mips/include/asm/mach-ali/cpu-feature-overrides.h b/arch/mips/include/asm/mach-ali/cpu-feature-overrides.h
+new file mode 100644
+index 00000000..7f94ad68
+--- /dev/null
++++ b/arch/mips/include/asm/mach-ali/cpu-feature-overrides.h
+@@ -0,0 +1,26 @@
++/*
++ *  ALi C3503D specific CPU feature overrides
++ *
++ *  The C3503D core is a MIPS 4K-family core running in fixed mapping
++ *  mode (Config0.MT == 3, PRId 0x18055, MIPS32 release 1): there is no
++ *  TLB at all (Config1.MMU_size reads as 0) and no FPU.  Pins the
++ *  features the generic probe cannot infer from Config registers, so
++ *  the compiler can drop the dead code.
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License version 2 as published
++ *  by the Free Software Foundation.
++ */
++#ifndef __ASM_MACH_ALI_CPU_FEATURE_OVERRIDES_H
++#define __ASM_MACH_ALI_CPU_FEATURE_OVERRIDES_H
++
++#define cpu_has_tlb		0
++#define cpu_has_tlbinv		0
++#define cpu_has_ftlb		0
++#define cpu_has_fpu		0
++#define cpu_has_64bits		0
++#define cpu_has_mips32r1	1
++#define cpu_has_mips32r2	0
++#define cpu_has_mipsmt		0
++
++#endif /* __ASM_MACH_ALI_CPU_FEATURE_OVERRIDES_H */
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+index e43aca18..a3a99ad6 100644
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -489,4 +489,5 @@
+ #define MIPS_CONF_MT		(_ULCAST_(7) <<	 7)
+ #define MIPS_CONF_MT_TLB	(_ULCAST_(1) <<  7)
++#define MIPS_CONF_MT_FMT	(_ULCAST_(3) <<  7)	/* fixed mapping */
+ #define MIPS_CONF_MT_FTLB	(_ULCAST_(4) <<  7)
+ #define MIPS_CONF_AR		(_ULCAST_(7) << 10)
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+index 157c08c3..26f178cd 100644
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -423,4 +423,13 @@ static inline unsigned int decode_config0(struct cpuinfo_mips *c)
+ 	else if (mt == MIPS_CONF_MT_FTLB)
+ 		c->options |= MIPS_CPU_TLB | MIPS_CPU_FTLB;
++	else if (mt == MIPS_CONF_MT_FMT) {
++		/*
++		 * Fixed mapping MMU: no TLB, kuseg and kseg0 are
++		 * statically mapped by the core.  Leave MIPS_CPU_TLB
++		 * unset; decode_config1() then skips the tlbsize read
++		 * (Config1.MMU_size reads as 0 here anyway).
++		 */
++		c->tlbsize = 0;
++	}
+ 
+ 	isa = (config0 & MIPS_CONF_AT) >> 13;

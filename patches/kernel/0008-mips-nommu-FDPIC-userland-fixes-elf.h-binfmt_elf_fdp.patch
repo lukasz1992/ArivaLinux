@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:39:53 +0100
+Subject: [PATCH] mips nommu: FDPIC userland fixes (elf.h,
+ binfmt_elf_fdpic, process)
+
+Fixes found while bringing up static-PIE userland on the no-MMU MIPS port.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ arch/mips/include/asm/elf.h | 18 ++++++++++++++++++
+ arch/mips/kernel/process.c  |  6 ++++++
+ fs/binfmt_elf_fdpic.c       |  7 +++++++
+ 3 files changed, 31 insertions(+)
+
+diff --git a/arch/mips/include/asm/elf.h b/arch/mips/include/asm/elf.h
+index c7008538..3b54c3e4 100644
+--- a/arch/mips/include/asm/elf.h
++++ b/arch/mips/include/asm/elf.h
+@@ -468,4 +468,22 @@ extern int arch_check_elf(void *ehdr, bool has_interpreter,
+ 			  struct arch_elf_state *state);
+ 
++/*
++ * One-argument SET_PERSONALITY: binfmt_elf_fdpic (and anything else
++ * calling the generic hook from include/linux/elf.h) must end up with
++ * the same personality and ABI state that the full binfmt_elf path
++ * produces via SET_PERSONALITY2() -- in particular
++ * current->thread.abi.  Without it an FDPIC-exec'ed task keeps
++ * thread.abi == NULL and the first signal delivery dereferences the
++ * ABI pointer (setup_frame/setup_rt_frame) and jumps to garbage.
++ * The FP mode stays at INIT_ARCH_ELF_STATE: FDPIC images carry no
++ * FP-ABI phdrs, and without CONFIG_MIPS_O32_FP64_SUPPORT
++ * mips_set_personality_fp() is a no-op anyway.
++ */
++#define SET_PERSONALITY(ex)						\
++do {									\
++	struct arch_elf_state __fdpic_fp_state = INIT_ARCH_ELF_STATE;	\
++	SET_PERSONALITY2(ex, &__fdpic_fp_state);			\
++} while (0)
++
+ extern void mips_set_personality_fp(struct arch_elf_state *state);
+ 
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index 68762918..46c6e1d7 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -70,4 +70,10 @@ void start_thread(struct pt_regs * regs, unsigned long pc, unsigned long sp)
+ 	 */
+ 	status = regs->cp0_status & ~(ST0_CU0|ST0_CU1|ST0_CU2|ST0_FR|KU_MASK);
++	/*
++	 * Make the user Status deterministic instead of inherited: userland
++	 * lives in kernel mode and needs the CP0 timer (IP7) and the INTC
++	 * cascade (IP3; EHCI and friends) interruptible.
++	 */
++	status |= ST0_IE | STATUSF_IP7 | STATUSF_IP3;
+ 	regs->cp0_status = status;
+ #else
+diff --git a/fs/binfmt_elf_fdpic.c b/fs/binfmt_elf_fdpic.c
+index 22d62656..b5d38d60 100644
+--- a/fs/binfmt_elf_fdpic.c
++++ b/fs/binfmt_elf_fdpic.c
+@@ -585,6 +585,13 @@ static int create_elf_fdpic_tables(struct linux_binprm *bprm,
+ #define DLINFO_ITEMS 15
+ 
++#ifdef ARCH_DLINFO
+ 	nitems = 1 + DLINFO_ITEMS + (k_platform ? 1 : 0) +
+ 		(k_base_platform ? 1 : 0) + AT_VECTOR_SIZE_ARCH;
++#else
++	/* the arch block below is #ifdef'd out too, so it would reserve
++	 * space it never fills and leave csp != sp at the BUG_ON below */
++	nitems = 1 + DLINFO_ITEMS + (k_platform ? 1 : 0) +
++		(k_base_platform ? 1 : 0);
++#endif
+ 
+ 	if (bprm->interp_flags & BINPRM_FLAGS_EXECFD)

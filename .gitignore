@@ -1,0 +1,20 @@
+dl/
+out/
+out-*/
+build/
+__pycache__/
+*.pyc
+*.part
+dist/
+backups/
+tools/diag/pydeps/
+
+# research and diagnostics: kept on disk, not tracked (the repository only reproduces the .abs image)
+docs/
+tools/diag/
+tools/README-mkabs.md
+rootfs/README.md
+rootfs/display-init/
+userspace/README.md
+boards/*/README.md
+boards/*/display-init/

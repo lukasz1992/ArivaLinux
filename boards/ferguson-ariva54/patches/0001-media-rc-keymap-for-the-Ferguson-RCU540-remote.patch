@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukasz M <lukasz1992m+alilinux@gmail.com>
+Date: Sun, 22 Nov 2026 12:42:15 +0100
+Subject: [PATCH] media: rc: keymap for the Ferguson RCU540 remote
+
+Extended NEC, address 0x02 0x02.  The codes come from the A54 firmware's
+key table; key meanings follow the vendor SDK's virtual key numbering
+(entries marked "?" are unconfirmed).  Selected by boards through the
+ali-ir platform data.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/media/rc/keymaps/Makefile             |  1 +
+ drivers/media/rc/keymaps/rc-ferguson-rcu540.c | 66 +++++++++++++++++++
+ include/media/rc-map.h                        |  1 +
+ 3 files changed, 68 insertions(+)
+ create mode 100644 drivers/media/rc/keymaps/rc-ferguson-rcu540.c
+
+diff --git a/drivers/media/rc/keymaps/Makefile b/drivers/media/rc/keymaps/Makefile
+index fbbd3bbc..8e881d57 100644
+--- a/drivers/media/rc/keymaps/Makefile
++++ b/drivers/media/rc/keymaps/Makefile
+@@ -35,4 +35,5 @@ obj-$(CONFIG_RC_MAP) += rc-adstech-dvb-t-pci.o \
+ 			rc-encore-enltv-fm53.o \
+ 			rc-evga-indtube.o \
++			rc-ferguson-rcu540.o \
+ 			rc-eztv.o \
+ 			rc-flydvb.o \
+diff --git a/drivers/media/rc/keymaps/rc-ferguson-rcu540.c b/drivers/media/rc/keymaps/rc-ferguson-rcu540.c
+new file mode 100644
+index 00000000..1bb4d747
+--- /dev/null
++++ b/drivers/media/rc/keymaps/rc-ferguson-rcu540.c
+@@ -0,0 +1,66 @@
++/* Keymap of the Ferguson RCU540 remote control. */
++#include <linux/module.h>
++#include <media/rc-map.h>
++
++/*
++ * Ferguson RCU540 remote (shipped with the Ariva 54 and its relatives):
++ * extended NEC, address 0x02 0x02 (scancode 0x0202cc).  Codes from the A54
++ * firmware's key table (g_itou_key_tab, read in AliSimulator with
++ * ir_remote.find_key_table); key meanings from the SDK's OSD_VKEY_t in the
++ * C3505-generation numbering (+2 from POWER), which the colour keys
++ * confirm.  Entries marked "?" are unconfirmed names.
++ */
++static struct rc_map_table rcu540_keys[] = {
++	{ 0x020244, KEY_NUMERIC_0 }, { 0x020212, KEY_NUMERIC_1 },
++	{ 0x020216, KEY_NUMERIC_2 }, { 0x020202, KEY_NUMERIC_3 },
++	{ 0x02021a, KEY_NUMERIC_4 }, { 0x02021e, KEY_NUMERIC_5 },
++	{ 0x020203, KEY_NUMERIC_6 }, { 0x02020f, KEY_NUMERIC_7 },
++	{ 0x02020b, KEY_NUMERIC_8 }, { 0x020207, KEY_NUMERIC_9 },
++	{ 0x02024d, KEY_LEFT }, { 0x02025d, KEY_RIGHT },
++	{ 0x020241, KEY_UP }, { 0x020245, KEY_DOWN },
++	{ 0x020211, KEY_OK }, { 0x020250, KEY_MENU }, { 0x020201, KEY_EXIT },
++	{ 0x02020e, KEY_POWER }, { 0x020240, KEY_MUTE },
++	{ 0x020246, KEY_PAUSE }, { 0x02020a, KEY_TV },		/* TV/Radio */
++	{ 0x020258, KEY_INFO },
++	{ 0x02021d, KEY_CHANNELUP }, { 0x020280, KEY_CHANNELDOWN },
++	{ 0x020251, KEY_VOLUMEUP }, { 0x020259, KEY_VOLUMEDOWN },
++	{ 0x02025c, KEY_PAGEUP }, { 0x020254, KEY_PAGEDOWN },
++	{ 0x020248, KEY_EPG },
++	{ 0x020213, KEY_RED },		/* also TEXT */
++	{ 0x020217, KEY_GREEN },	/* also AUDIO */
++	{ 0x02021b, KEY_YELLOW },	/* also SUBTITLE */
++	{ 0x02021f, KEY_BLUE },		/* also FIND */
++	{ 0x020205, KEY_FAVORITES }, { 0x020249, KEY_SAT },
++	{ 0x020206, KEY_SLEEP },	/* ? */
++	{ 0x020256, KEY_LIST },		/* ? */
++	{ 0x020255, KEY_RECORD }, { 0x02024a, KEY_STOP }, { 0x02020d, KEY_PLAY },
++	{ 0x020242, KEY_FASTFORWARD }, { 0x02025a, KEY_NEXT },
++	{ 0x020208, KEY_SCREEN },	/* V.Format ? */
++	{ 0x020209, KEY_VIDEO },	/* ? */
++	{ 0x02020c, KEY_GAMES },	/* ? */
++	{ 0x020260, KEY_OPTION },	/* ? */
++};
++
++static struct rc_map_list rcu540_map = {
++	.map = {
++		.scan    = rcu540_keys,
++		.size    = ARRAY_SIZE(rcu540_keys),
++		.rc_type = RC_TYPE_NEC,
++		.name    = RC_MAP_FERGUSON_RCU540,
++	}
++};
++
++static int __init init_rc_map_rcu540(void)
++{
++	return rc_map_register(&rcu540_map);
++}
++
++static void __exit exit_rc_map_rcu540(void)
++{
++	rc_map_unregister(&rcu540_map);
++}
++
++module_init(init_rc_map_rcu540)
++module_exit(exit_rc_map_rcu540)
++
++MODULE_LICENSE("GPL");
+diff --git a/include/media/rc-map.h b/include/media/rc-map.h
+index 7c4bbc4d..4829446f 100644
+--- a/include/media/rc-map.h
++++ b/include/media/rc-map.h
+@@ -141,4 +141,5 @@ void rc_map_init(void);
+ #define RC_MAP_ENCORE_ENLTV              "rc-encore-enltv"
+ #define RC_MAP_EVGA_INDTUBE              "rc-evga-indtube"
++#define RC_MAP_FERGUSON_RCU540           "rc-ferguson-rcu540"
+ #define RC_MAP_EZTV                      "rc-eztv"
+ #define RC_MAP_FLYDVB                    "rc-flydvb"
